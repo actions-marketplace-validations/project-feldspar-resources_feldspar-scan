@@ -2,7 +2,19 @@
 
 A stdlib-only HTTP wrapper around `../scan.py`. It does not modify or
 re-implement any scanner logic: each request shells out to
-`python3 scan.py <url> --json <tmpfile>` and renders the JSON.
+`python3 scan.py <url> --json <tmpfile> --triage` and renders the JSON.
+
+`--triage` adds the deterministic interpretation layer (top-level
+`triage_summary` + per-finding `triage`): dependency advisories are marked
+`upgrade` (a patched release exists) or `monitor` (none yet), and secret hits
+are marked `likely_false_positive` (test/fixture/example path or placeholder)
+or `review`. It is additive and discovers nothing new — the `findings` array
+and `manifest_hash` are byte-identical with or without it, so the verifiable
+trust anchor is unchanged. The HTML results render a **Triage** summary and a
+per-finding Triage column; the MCP `scan_repository` reply includes the triage
+headline in its text and the full `triage`/`triage_summary` in
+`structuredContent`. Full-depth triage with a human reviewer is the paid $49
+snapshot.
 
 ## Run locally
 

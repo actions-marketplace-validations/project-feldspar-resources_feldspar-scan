@@ -171,12 +171,66 @@ def badge(sev):
             f"{SEV_COLOR.get(sev, SEV_COLOR['unknown'])}\">{E(sev)}</span>")
 
 
+# Triage action -> display label + colour. The triage layer is deterministic
+# (fix-status + false-positive heuristics); it discovers nothing new.
+TRIAGE_COLOR = {"upgrade": "#1f883d", "monitor": "#9a6700",
+                "review": "#0969da", "informational": "#6e7781"}
+
+
+def triage_cell(t):
+    """Render the per-finding triage verdict as a labelled chip + note tooltip."""
+    if not t:
+        return "<span class=\"muted\">&mdash;</span>"
+    action = str(t.get("action") or "review")
+    label = action
+    if action == "upgrade" and t.get("upgrade_to"):
+        up = t.get("upgrade_to")
+        up = ", ".join(str(x) for x in up) if isinstance(up, (list, tuple)) else str(up)
+        label = "upgrade &rarr; " + E(up)
+    elif action == "informational" and t.get("likely_false_positive"):
+        label = "likely false positive"
+    note = str(t.get("note") or t.get("reason") or "")
+    chip = (f"<span class=\"badge\" style=\"background:"
+            f"{TRIAGE_COLOR.get(action, TRIAGE_COLOR['review'])}\">{label}</span>")
+    return f"<span title=\"{E(note)}\">{chip}</span>" if note else chip
+
+
+def triage_block(tsummary):
+    """Render the top-level triage summary (headline + counts) above the table."""
+    if not tsummary:
+        return ""
+    head = E(str(tsummary.get("headline") or ""))
+    dep = tsummary.get("dependency") or {}
+    sec = tsummary.get("secrets") or {}
+    chips = []
+    if dep.get("upgradeable"):
+        chips.append(f"<span><strong>fix by upgrade</strong>: {E(str(dep['upgradeable']))}</span>")
+    if dep.get("monitor_only"):
+        chips.append(f"<span><strong>no patch yet (monitor)</strong>: {E(str(dep['monitor_only']))}</span>")
+    if sec.get("needs_review"):
+        chips.append(f"<span><strong>secrets to review</strong>: {E(str(sec['needs_review']))}</span>")
+    if sec.get("likely_false_positive"):
+        chips.append(f"<span><strong>secrets likely false-positive</strong>: "
+                     f"{E(str(sec['likely_false_positive']))}</span>")
+    counts = f"<div class=\"counts\">{''.join(chips)}</div>" if chips else ""
+    return ("<h2>Triage</h2>"
+            f"<p><strong>{head}.</strong></p>"
+            + counts
+            + "<p class=\"muted\">Deterministic interpretation layer: it classifies and "
+              "prioritises the findings below (fix-status for dependency advisories, a "
+              "test-path/placeholder heuristic for secrets). It discovers nothing new and "
+              "adds no findings; the raw findings and <code>manifest_hash</code> are "
+              "unchanged. Full-depth triage with a human reviewer is the paid snapshot.</p>")
+
+
 def results_html(doc):
     target = str(doc.get("target", ""))
     commit = str(doc.get("commit") or "")
     scanned = str(doc.get("scanned_at") or "")
     summary = doc.get("summary") or {}
     findings = doc.get("findings") or []
+    triage = doc.get("triage") or {}
+    tsummary = doc.get("triage_summary") or {}
 
     counts = "".join(
         f"<span><strong>{E(str(k))}</strong>: {E(str(v))}</span>"
@@ -201,6 +255,7 @@ def results_html(doc):
             f"<td><code>{E(str(f.get('id') or ''))}</code></td>"
             f"<td>{E(str(f.get('category') or ''))}</td>"
             f"<td>{badge(f.get('severity'))}</td>"
+            f"<td>{triage_cell(triage.get(str(f.get('id') or '')))}</td>"
             f"<td><code>{E(loc)}</code></td>"
             f"<td>{pkg}</td>"
             f"<td>{E(str(f.get('summary') or ''))}</td>"
@@ -208,6 +263,7 @@ def results_html(doc):
             f"<td><code>{E(str(f.get('evidence') or ''))}</code></td>"
             "</tr>")
     table = ("<table><thead><tr><th>ID</th><th>Category</th><th>Severity</th>"
+             "<th>Triage</th>"
              "<th>File:line</th><th>Package</th><th>Summary</th><th>Fixed in</th>"
              "<th>Evidence</th></tr></thead><tbody>"
              + "".join(rows) + "</tbody></table>") if rows else \
@@ -234,6 +290,7 @@ def results_html(doc):
         f"<strong>manifest_hash:</strong> <code>{E(str(doc.get('manifest_hash') or ''))}</code></p>"
         f"<div class=\"counts\">{counts}</div>"
         + err_html
+        + triage_block(tsummary)
         + "<h2>Findings</h2>"
         + more + table
         + "<p class=\"muted\">Deterministic output only: no false-positive "
@@ -291,7 +348,7 @@ def run_scan(url):
         env["GIT_ASKPASS"] = "/bin/true"
         try:
             proc = subprocess.run(
-                [sys.executable, SCAN_PY, url, "--json", out],
+                [sys.executable, SCAN_PY, url, "--json", out, "--triage"],
                 cwd=SCANNER_DIR, env=env, capture_output=True, text=True,
                 stdin=subprocess.DEVNULL, timeout=SCAN_TIMEOUT)
         except subprocess.TimeoutExpired:
@@ -479,10 +536,15 @@ def mcp_scan(url, ip):
         trimmed["truncated"] = {"shown": MCP_MAX_FINDINGS, "total": len(findings),
                                 "full_report": "POST https://project-feldspar.com/scan/scan {\"url\": ...}"}
     summary = doc.get("summary") or {}
-    head = ("feldspar-scan %s of %s: %d finding(s). Summary: %s. Full JSON follows; "
+    tsummary = doc.get("triage_summary") or {}
+    triage_line = ""
+    if tsummary.get("headline"):
+        triage_line = " Triage: %s (deterministic interpretation; see triage/triage_summary)." % \
+                      tsummary["headline"]
+    head = ("feldspar-scan %s of %s: %d finding(s). Summary: %s.%s Full JSON follows; "
             "this is a deterministic discovery scan, not a security audit." % (
                 doc.get("version", MCP_SERVER_INFO["version"]), url, len(findings),
-                json.dumps(summary, sort_keys=True)))
+                json.dumps(summary, sort_keys=True), triage_line))
     return {"content": [{"type": "text", "text": head},
                         {"type": "text", "text": json.dumps(trimmed, sort_keys=True)}],
             "structuredContent": trimmed, "isError": False}
