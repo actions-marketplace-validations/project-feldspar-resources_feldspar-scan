@@ -17,8 +17,12 @@ its own findings for false positives.
 
 ```
 curl -fsSLO https://raw.githubusercontent.com/project-feldspar-resources/feldspar-scan/main/scan.py
-python3 scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] [--fail-on high]
+python3 scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] [--fail-on high] [--triage]
 ```
+
+`--triage` adds a deterministic interpretation layer on top of the raw findings
+(see *Triage* under Output shape). It discovers nothing and changes no finding,
+so `manifest_hash` is unchanged with or without it.
 
 **2. GitHub Action** (composite; runs on the checked-out tree):
 
@@ -99,6 +103,24 @@ Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
 Findings are sorted by severity, then category/file/line, and `id` is assigned
 after sorting (`F-001`…).
+
+### Triage (`--triage`)
+
+With `--triage` the output gains two additive top-level keys and the raw findings
+and `manifest_hash` stay untouched:
+
+- `triage_summary` — counts and a one-line `headline`: dependency advisories split
+  into `upgradeable` (a patched release exists) vs `monitor_only` (no patch yet),
+  and secret hits split into `needs_review` vs `likely_false_positive`.
+- `triage` — a map from finding `id` to an interpretation: for a `dependency-vuln`,
+  `action` is `upgrade` (with `upgrade_to`) or `monitor`; for a `secret`,
+  `likely_false_positive` is set true when the hit sits in a test/fixture/example/CI
+  path or a placeholder value, routing everything else to `review`; `config` findings
+  are `review`.
+
+This is purely deterministic prioritisation (fix-status + path-based false-positive
+classification). It never clears a secret found in real source — it flags it for a
+human. It exists so a reader does not have to hand-triage a long raw list.
 
 ## What it checks
 

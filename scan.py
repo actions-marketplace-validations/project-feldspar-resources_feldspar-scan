@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
-Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] [--fail-on SEV]
+Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
+               [--fail-on SEV] [--triage]
 
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
                   "unknown"-severity findings never trigger the gate.
+  --triage        add a deterministic interpretation layer (top-level "triage" +
+                  "triage_summary"): classifies secret hits in test/fixture/example
+                  paths as likely false positives, and marks each dependency advisory
+                  as upgrade (patch available) or monitor (no patched release yet).
+                  Discovers nothing and adds no findings, so the raw findings set and
+                  manifest_hash are unchanged; triage is a separate, additive section.
 """
 import hashlib
 import json
@@ -23,7 +30,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.2"
+VERSION = "0.3"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -463,6 +470,93 @@ def scan_config(root, files, add):
                     break
 
 
+# ---------------------------------------------------------------- triage
+# Deterministic interpretation layer (the paid "snapshot" value-add, W233).
+# It discovers nothing and adds no findings; it only classifies and prioritises
+# the deterministic findings above. The raw findings set and manifest_hash stay
+# the verifiable trust anchor; triage is a separate, additive section surfaced
+# only with --triage. This automates the hand-triage done on the first $49
+# fulfilment dry run (mealie, 2026-10-05): fix-status action + secret FP filter.
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec|specs|fixtures?|testdata|mocks?|examples?|"
+    r"samples?|demos?|e2e|cypress|\.github|docs?|stories)(/|$)", re.I)
+TEST_FILE_RE = re.compile(
+    r"(\.(test|spec)\.[a-z0-9]+$|_test\.[a-z0-9]+$|^test_|^conftest\.py$|"
+    r"\.(example|sample|template|dist)$)", re.I)
+
+
+def _secret_false_positive(f):
+    """Return (is_fp, reason) for a secret finding from path + evidence heuristics."""
+    path = f.get("file") or ""
+    base = path.rsplit("/", 1)[-1]
+    m = TEST_PATH_RE.search(path)
+    if m:
+        return True, "in a test/fixture/example path (%s)" % m.group(2).lower()
+    if TEST_FILE_RE.search(base):
+        return True, "filename marks it as a test/example/template"
+    if "placeholder?" in (f.get("evidence") or ""):
+        return True, "value looks like a placeholder, not a real secret"
+    return False, None
+
+
+def _triage_headline(up, mon, sec_review, sec_fp):
+    parts = []
+    if up:
+        parts.append("%d dependency advisory/ies fixable by upgrade" % up)
+    if mon:
+        parts.append("%d dependency advisory/ies with no patch yet (monitor/mitigate)" % mon)
+    if sec_review:
+        parts.append("%d secret hit(s) needing review" % sec_review)
+    if sec_fp:
+        parts.append("%d secret hit(s) classified likely-false-positive" % sec_fp)
+    return "; ".join(parts) if parts else "no actionable findings after triage"
+
+
+def triage_findings(findings):
+    """Deterministic interpretation of the raw findings. Returns (per_id, summary)."""
+    per_id = {}
+    dep_upgrade = dep_monitor = 0
+    sec_total = sec_fp = 0
+    for f in findings:
+        cat = f["category"]
+        t = {}
+        if cat == "dependency-vuln":
+            fixed = f.get("fixed_in") or []
+            if fixed:
+                t = {"action": "upgrade", "upgrade_to": fixed,
+                     "note": "Patched release available: upgrade %s to %s."
+                             % (f.get("package"), " / ".join(fixed))}
+                dep_upgrade += 1
+            else:
+                t = {"action": "monitor",
+                     "note": ("No patched release published for the advisory yet; pin the "
+                              "version, monitor the advisory, and apply any documented "
+                              "mitigation. Not fixable by upgrade today.")}
+                dep_monitor += 1
+        elif cat == "secret":
+            sec_total += 1
+            is_fp, reason = _secret_false_positive(f)
+            if is_fp:
+                sec_fp += 1
+                t = {"action": "informational", "likely_false_positive": True,
+                     "reason": reason,
+                     "note": "Likely not a live secret (%s); verify, but low priority." % reason}
+            else:
+                t = {"action": "review", "likely_false_positive": False,
+                     "note": ("In a non-test path; confirm it is not a live credential and, "
+                              "if real, rotate it and purge it from history.")}
+        else:  # config / other
+            t = {"action": "review"}
+        per_id[f["id"]] = t
+    summary = {
+        "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor},
+        "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
+                    "needs_review": sec_total - sec_fp},
+        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp),
+    }
+    return per_id, summary
+
+
 # ------------------------------------------------------------------ main
 def git_head(path):
     try:
@@ -479,7 +573,7 @@ def main(argv):
         print(__doc__.strip())
         return 0
     target = args[0]
-    out_path, use_osv, fail_on = None, True, None
+    out_path, use_osv, fail_on, triage = None, True, None, False
     i = 1
     while i < len(args):
         if args[i] == "--json" and i + 1 < len(args):
@@ -487,6 +581,9 @@ def main(argv):
             i += 2
         elif args[i] == "--no-osv":
             use_osv = False
+            i += 1
+        elif args[i] == "--triage":
+            triage = True
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
@@ -575,6 +672,10 @@ def main(argv):
     canon = json.dumps({"findings": findings, "target": target, "commit": commit},
                        sort_keys=True, separators=(",", ":"))
     doc["manifest_hash"] = hashlib.sha256(canon.encode()).hexdigest()
+    if triage:
+        per_id, tsummary = triage_findings(findings)
+        doc["triage_summary"] = tsummary
+        doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
     text = json.dumps(doc, indent=2)
