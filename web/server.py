@@ -566,6 +566,12 @@ class Handler(BaseHTTPRequestHandler):
             self.client_ip(), self.command, self.path, status,
             time.monotonic() - started,
             (" target=" + target) if target else "")
+        # Usage lines (a tool call or a web scan) also carry the client's User-Agent, so the routine watch can
+        # tell a self-declared registry probe from a real user without joining the nginx log. Liveness traffic
+        # (initialize/tools/list/ping) stays compact. Quotes/newlines stripped, 100 chars max.
+        if target and (target.startswith("mcp:tools/call") or not target.startswith("mcp")):
+            ua = (self.headers.get("User-Agent") or "-").replace('"', "'").replace("\n", " ")[:100]
+            line += ' ua="%s"' % ua
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
 
@@ -661,7 +667,12 @@ class Handler(BaseHTTPRequestHandler):
         method = msg.get("method") if isinstance(msg, dict) else None
         target = "mcp:%s" % (method or "response")
         if method == "tools/call":
-            target += ":%s" % ((msg.get("params") or {}).get("name"),)
+            params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+            target += ":%s" % (params.get("name"),)
+            args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+            if params.get("name") == "scan_repository" and args.get("url"):
+                # the scanned URL is the one fact that separates a probe (fixed sample repo) from a user (their own)
+                target += " url=%s" % (str(args.get("url")).split() or ["-"])[0][:200]
         st, resp = mcp_handle(msg, ip)
         if resp is None:
             self.send(202, b"", "application/json; charset=utf-8")
