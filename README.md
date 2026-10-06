@@ -49,9 +49,11 @@ not affected by triage. Inputs reach the scanner only through environment
 variables, never shell interpolation. Pin to a release tag (`@v0.3.0`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
-*Status note: the composite action is exercised locally with the same environment
-contract (`GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`) on every release, not on a
-GitHub-hosted runner. Please open an issue if it misbehaves.*
+[![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
+— the composite action runs on itself (`.github/workflows/selftest.yml`: the
+known-vulnerable `test_fixture` on a GitHub-hosted runner, asserting the outputs,
+the triage sections, the offline mode and the `fail-on` gate) on every push and
+tag. Please open an issue if it misbehaves in your workflow.
 
 **3. Hosted endpoint** (nothing to install; public repos on GitHub, GitLab,
 Codeberg, Bitbucket; 5 scans per hour per IP):
