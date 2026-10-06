@@ -1,0 +1,52 @@
+name: self-test
+# Runs the composite action on its own test fixture on a GitHub-hosted runner.
+# The fixture is known-vulnerable, so the gate is left at "none" and the
+# assertions check the outputs instead of the exit code.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: scan
+        uses: ./
+        with:
+          path: test_fixture
+          fail-on: none
+          output: fixture-scan.json
+      - name: assert outputs
+        env:
+          FINDINGS: ${{ steps.scan.outputs.findings }}
+          HASH: ${{ steps.scan.outputs.manifest-hash }}
+          HEADLINE: ${{ steps.scan.outputs.triage-headline }}
+        run: |
+          echo "findings=$FINDINGS hash=$HASH"
+          echo "triage: $HEADLINE"
+          test "$FINDINGS" -ge 4
+          test -n "$HASH"
+          test -n "$HEADLINE"
+          python3 -c "import json; d=json.load(open('fixture-scan.json')); assert d['triage_summary'] and d['triage'], 'triage sections missing'"
+      - id: raw
+        uses: ./
+        with:
+          path: test_fixture
+          fail-on: high
+          osv: "false"
+          triage: "false"
+          output: raw-scan.json
+        continue-on-error: true
+      - name: assert gate + raw mode
+        env:
+          OUTCOME: ${{ steps.raw.outcome }}
+          HEADLINE: ${{ steps.raw.outputs.triage-headline }}
+        run: |
+          test "$OUTCOME" = "failure"      # fixture has a high config finding -> gate trips offline too
+          test -z "$HEADLINE"
+          python3 -c "import json; d=json.load(open('raw-scan.json')); assert 'triage' not in d"
