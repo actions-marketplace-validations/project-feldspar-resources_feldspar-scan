@@ -21,6 +21,10 @@ inputs:
     description: "Query OSV.dev for dependency advisories. Set to 'false' for an offline scan (secrets and config checks only)."
     required: false
     default: "true"
+  triage:
+    description: "Add the deterministic triage layer (upgrade vs monitor per advisory, likely-false-positive secret hits). Additive: findings and manifest-hash are unchanged. Set to 'false' for the raw list only."
+    required: false
+    default: "true"
 outputs:
   findings:
     description: "Total number of findings."
@@ -31,6 +35,9 @@ outputs:
   manifest-hash:
     description: "sha256 over the canonical findings, target and commit; stable for the same commit while OSV data is unchanged."
     value: ${{ steps.scan.outputs.manifest_hash }}
+  triage-headline:
+    description: "One-line triage summary (empty when triage is 'false'), e.g. '2 dependency advisory/ies fixable by upgrade; 1 secret hit(s) needing review'."
+    value: ${{ steps.scan.outputs.triage_headline }}
 runs:
   using: "composite"
   steps:
@@ -41,5 +48,6 @@ runs:
         FDS_FAIL_ON: ${{ inputs.fail-on }}
         FDS_OUTPUT: ${{ inputs.output }}
         FDS_OSV: ${{ inputs.osv }}
+        FDS_TRIAGE: ${{ inputs.triage }}
         FDS_ACTION_PATH: ${{ github.action_path }}
       run: python3 "$FDS_ACTION_PATH/action_run.py"

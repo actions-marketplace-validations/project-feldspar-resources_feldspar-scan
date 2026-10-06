@@ -28,10 +28,11 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@main
+- uses: project-feldspar-resources/feldspar-scan@v0.3.0
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
+    triage: "true"         # default; "false" = raw findings only
 # optional: keep the report
 - uses: actions/upload-artifact@v4
   if: always()
@@ -39,13 +40,17 @@ so `manifest_hash` is unchanged with or without it.
 ```
 
 Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
-(`false` = offline). Outputs: `findings`, `report`, `manifest-hash`. A Markdown
-table of findings is written to the job summary. Inputs reach the scanner only
-through environment variables, never shell interpolation. Pin to a tag or a
-commit SHA once one exists if you need reproducibility.
+(`false` = offline), `triage` (default `true`). Outputs: `findings`, `report`,
+`manifest-hash`, `triage-headline`. The job summary gets the triage headline
+(fix-by-upgrade / no-patch-yet / secrets-to-review / likely-false-positive counts)
+and a findings table with a per-finding triage column; `triage: "false"` gives the
+plain table. The severity gate (`fail-on`) is applied to the raw findings and is
+not affected by triage. Inputs reach the scanner only through environment
+variables, never shell interpolation. Pin to a release tag (`@v0.3.0`) or a commit
+SHA if you need reproducibility; `@main` tracks development.
 
-*Status note (2026-09-03): the composite action was exercised locally with the
-same environment contract (`GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`), not yet on a
+*Status note: the composite action is exercised locally with the same environment
+contract (`GITHUB_OUTPUT`, `GITHUB_STEP_SUMMARY`) on every release, not on a
 GitHub-hosted runner. Please open an issue if it misbehaves.*
 
 **3. Hosted endpoint** (nothing to install; public repos on GitHub, GitLab,
