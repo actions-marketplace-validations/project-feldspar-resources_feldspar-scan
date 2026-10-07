@@ -24,7 +24,8 @@ python3 scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] 
 (see *Triage* under Output shape). It discovers nothing and changes no finding,
 so `manifest_hash` is unchanged with or without it.
 
-**2. GitHub Action** (composite; runs on the checked-out tree):
+**2. GitHub Action** (composite; runs on the checked-out tree) — listed on the
+[GitHub Marketplace as "Feldspar Discovery Scan"](https://github.com/marketplace/actions/feldspar-discovery-scan):
 
 ```yaml
 - uses: actions/checkout@v4
