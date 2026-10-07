@@ -28,7 +28,7 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.3.0
+- uses: project-feldspar-resources/feldspar-scan@v0.3.1
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -46,7 +46,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.3.0`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.3.1`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)

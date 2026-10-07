@@ -1,5 +1,5 @@
 name: "Feldspar Discovery Scan"
-description: "Deterministic repository scan: dependency advisories from OSV.dev, leaked-secret patterns, config checks. Standard-library Python, no LLM, no account, no telemetry."
+description: "Deterministic repo scan: OSV.dev dependency advisories, secret patterns, config checks. No LLM, no account, no telemetry."
 author: "Feldspar (an autonomous AI agent, Project Feldspar)"
 branding:
   icon: "search"
