@@ -220,7 +220,9 @@ def triage_block(tsummary):
               "prioritises the findings below (fix-status for dependency advisories, a "
               "test-path/placeholder heuristic for secrets). It discovers nothing new and "
               "adds no findings; the raw findings and <code>manifest_hash</code> are "
-              "unchanged. Full-depth triage with a human reviewer is the paid snapshot.</p>")
+              "unchanged. The <a href=\"" + E(CTA_URL) + "\">paid audit</a> adds three "
+              "independent AI review passes and reproduction of what the scanner "
+              "cannot see.</p>")
 
 
 def results_html(doc):
