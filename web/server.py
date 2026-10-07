@@ -107,10 +107,22 @@ a{color:#1d4ed8}
 E = html.escape
 
 
-def page(title, body):
+INDEX_DESCRIPTION = ("Free, deterministic security scan of a public GitHub, GitLab, "
+                     "Codeberg or Bitbucket repository: dependency advisories from OSV.dev "
+                     "triaged into fix-by-upgrade versus monitor, leaked-secret patterns with "
+                     "likely false positives flagged, and config checks. No LLM, no sign-up.")
+INDEX_CANONICAL = "https://project-feldspar.com/scan/"
+
+
+def page(title, body, index=False):
+    # Only the landing page is indexable; scan results and error pages are
+    # per-request documents and stay noindex.
+    head = ("<meta name=\"robots\" content=\"noindex\">" if not index else
+            f"<meta name=\"description\" content=\"{E(INDEX_DESCRIPTION)}\">"
+            f"<link rel=\"canonical\" href=\"{INDEX_CANONICAL}\">")
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            "<meta name=\"robots\" content=\"noindex\">"
+            + head +
             f"<title>{E(title)}</title><style>{CSS}</style></head>"
             f"<body><main>{body}"
             f"<footer><p>{E(DISCLOSURE)}</p>"
@@ -156,7 +168,8 @@ def index_html():
         + cta_html() +
         "<script>document.getElementById('f').addEventListener('submit',function(){"
         "var b=document.getElementById('b');b.disabled=true;"
-        "b.textContent='Scanning\\u2026';});</script>")
+        "b.textContent='Scanning\\u2026';});</script>",
+        index=True)
 
 
 def message_page(title, heading, body_html, status_note=""):
