@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 jobs:
+  unit:
+    # stdlib unittest, no network: pins the documented heuristics (tests/test_scan.py)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests -v
   fixture:
     runs-on: ubuntu-latest
     steps:

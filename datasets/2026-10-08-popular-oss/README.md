@@ -69,6 +69,11 @@ and `--triage` clears them. Re-scan of the six repos that held 297 of the 313 ro
 What survives is the right residue: vendor API keys embedded in integrations, a TOTP secret, an OAuth secret, dev defaults
 with digits. I still have not verified any of them as live and name none as such.
 
+**Status (v0.4.2, same day):** the heuristics above are now pinned by a committed unit-test suite (`tests/test_scan.py`,
+run by the self-test workflow). Writing it exposed one more v0.4 bug: Yarn Berry `pkg@patch:pkg@npm:…` keys were split at
+the *last* `@`, so the `patch:`/`workspace:` skip never fired and a garbage package name (`pkg@patch:pkg`) was counted in
+`packages_found` (OSV returns nothing for it, so no advisory rows were affected). Fixed in v0.4.2.
+
 1. **`go.sum` is not the build graph.** 1,100 of the 2,453 rows are Go. Checking each Go repo's top-level
    `go.mod` at the same commit: of 1,099 vulnerable `go.sum` rows across caddy/gitea/hugo/prometheus/grafana/traefik,
    only **10** are at a version the top-level `go.mod` requires (caveat: prometheus and grafana have nested modules;

@@ -29,7 +29,7 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.1
+- uses: project-feldspar-resources/feldspar-scan@v0.4.2
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -47,14 +47,18 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.1`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.2`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
 — the composite action runs on itself (`.github/workflows/selftest.yml`: the
 known-vulnerable `test_fixture` on a GitHub-hosted runner, asserting the outputs,
 the triage sections, the offline mode and the `fail-on` gate) on every push and
-tag. Please open an issue if it misbehaves in your workflow.
+tag, and the same workflow runs the unit tests in `tests/` (stdlib `unittest`, no
+network: value-shape hints, path/filename triage rules, lockfile parsers, the
+redaction invariant, `manifest_hash` determinism and the gate — run them locally
+with `python3 -m unittest discover -s tests`). Please open an issue if it
+misbehaves in your workflow.
 
 **3. Hosted endpoint** (nothing to install; public repos on GitHub, GitLab,
 Codeberg, Bitbucket; 5 scans per hour per IP):
@@ -145,9 +149,10 @@ Manifests/lockfiles parsed (files under `node_modules/`, `vendor/`, `.git/`,
 | `poetry.lock`, `uv.lock` | PyPI | TOML `[[package]]` name/version |
 | `Cargo.lock` | crates.io | TOML `[[package]]` |
 | `package-lock.json` | npm | v2/v3 `packages` map; falls back to v1 `dependencies` tree |
-| `yarn.lock` (v1) | npm | `name@range:` header + `  version "x"` |
+| `yarn.lock` (v1 + Berry) | npm | v1 `name@range:` + `  version "x"`; Berry `"name@npm:range":` + `  version: x` (`workspace:`/`patch:`/`portal:`/`link:` entries skipped, v0.4; multi-`@` patch keys fixed v0.4.2) |
 | `pnpm-lock.yaml` | npm | `packages:` keys `/name@1.2.3` or `name@1.2.3` |
-| `go.sum` | Go | `/go.mod` suffix stripped |
+| `go.mod` | Go | the `require` build list (direct + `// indirect`); preferred over `go.sum` (v0.4) |
+| `go.sum` | Go | only when no `go.mod` sits beside it (go.sum also lists superseded versions); `/go.mod` suffix stripped |
 | `Gemfile.lock` | RubyGems | `specs:` section, `    name (1.2.3)` |
 
 Packages are deduped on `(ecosystem, name, version)` and sent to
