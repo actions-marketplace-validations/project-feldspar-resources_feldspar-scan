@@ -19,6 +19,11 @@ v0.4 (2026-10-08, from the 25-repo dataset in datasets/): go.mod is the Go build
 preferred over go.sum (which lists superseded versions too); Yarn Berry lockfiles are parsed;
 `summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed; URL values
 are never reported as hardcoded secrets.
+v0.4.1 (2026-10-08): second secret heuristic beyond paths — value-shape hints (template/env
+references, localized text, dotted identifier names, digit-less word-like values, form
+placeholders, documented example keys and masked values) tag the evidence `(hint?)`, drop the raw
+severity to low and are classified likely-false-positive by --triage; translation-catalogue paths
+(locales/, i18n/, …) and __fixtures__/__mocks__/testutils paths likewise.
 """
 import hashlib
 import json
@@ -37,7 +42,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4"
+VERSION = "0.4.1"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -418,10 +423,66 @@ def query_osv(packages):
 
 
 # --------------------------------------------------------------- secrets
-def _generic_sev(match_value):
-    if re.search(r"example|changeme|your[_-]|xxx|dummy|placeholder|<|\$\{", match_value, re.I):
-        return "low", "placeholder?"
-    return "medium", None
+# v0.4.1 value-shape hints. From the 2026-10-08 dataset (datasets/2026-10-08-popular-oss):
+# of the 313 secret hits the path/placeholder rule left for review, roughly two thirds were
+# template or env-variable references (`={{$credentials.apiKey}}`, `$__env{…}`, `#{…}`,
+# `var(--…)`), localized UI strings, syntax-highlighter scope names (`token: 'entity.name'`)
+# or AWS/Slack example values inside form `placeholder=` attributes. Each hint is appended
+# to the (redacted) evidence as `(hint?)` and downgrades the raw severity to low; triage
+# reads the same hints. A hint is a shape judgement, not proof — it never deletes a finding.
+VALUE_HINTS = {
+    "placeholder?": "value looks like a placeholder, not a real secret",
+    "expression?": "value is a template/env-variable reference, not a literal credential",
+    "non-ascii?": "value contains non-ASCII text (localized string or masked value); credentials are ASCII",
+    "dotted-name?": "value is a dotted identifier with no digits (highlighter scope / flag / host name)",
+    "form-placeholder?": "match sits in a form placeholder attribute (example text shown to users)",
+    "example-key?": "value is a documented example key or an x/0/* masked pattern",
+    "word-like?": "value is letters/underscores/hyphens only, no digits (constant name, enum value or field key)",
+}
+EXPR_RE = re.compile(r"^(=?\{\{|\$\{|\$__|\$[A-Za-z_]|\{env:|#\{|%\{|%\(|<%|var\(|@\{)")
+DOTTED_RE = re.compile(r"^[A-Za-z_][A-Za-z_-]*(\.[A-Za-z_][A-Za-z_-]*)+$")
+WORD_RE = re.compile(r"^[A-Za-z][A-Za-z_-]*$")
+EXAMPLE_KEYS = {
+    "AKIAIOSFODNN7EXAMPLE", "AKIAI44QH8DHBEXAMPLE",          # AWS documentation keys
+    "ghp_16C7e42F292c6912E7710c838347Ae178B4a",               # GitHub docs example token
+}
+MASKED_RE = re.compile(r"x{6,}|X{6,}|0{8,}|\*{4,}|EXAMPLE")
+PLACEHOLDER_ATTR_RE = re.compile(r"placeholder\s*[:=]\s*[{'\"]", re.I)
+
+
+def _value_hint(value, line_prefix=""):
+    """Shape hint for a generic `key = "value"` hit (None = looks like a literal credential)."""
+    if re.search(r"example|changeme|your[_-]|xxx|dummy|placeholder|<|\$\{", value, re.I):
+        return "placeholder?"
+    if any(ord(c) > 127 for c in value):
+        return "non-ascii?"
+    if EXPR_RE.match(value):
+        return "expression?"
+    if DOTTED_RE.match(value):
+        return "dotted-name?"
+    if MASKED_RE.search(value):
+        return "example-key?"
+    if WORD_RE.match(value):
+        # home-assistant dataset: `ATTR_TOKEN = "long_lived_access_token"`, growatt field names,
+        # header names — identifiers, not credentials (random credentials carry digits)
+        return "word-like?"
+    if PLACEHOLDER_ATTR_RE.search(line_prefix[-40:]):
+        return "form-placeholder?"
+    return None
+
+
+def _pattern_hint(matched, line_prefix=""):
+    """Shape hint for a fixed-pattern hit (AWS/Slack/GitHub…): documented example or masked value."""
+    if matched in EXAMPLE_KEYS or MASKED_RE.search(matched):
+        return "example-key?"
+    if PLACEHOLDER_ATTR_RE.search(line_prefix[-40:]):
+        return "form-placeholder?"
+    return None
+
+
+def _generic_sev(match_value, line_prefix=""):
+    note = _value_hint(match_value, line_prefix)
+    return ("low", note) if note else ("medium", None)
 
 
 SECRET_PATTERNS = [
@@ -461,13 +522,18 @@ def scan_secrets(root, files, add):
                         nxt = lines[lineno] if lineno < len(lines) else ""
                         if not re.match(r"^\s*[A-Za-z0-9+/=]{20,}\s*$", nxt):
                             continue
-                    add("secret", sev, rel, lineno, summary=desc + " detected",
-                        evidence=redact(m.group(0)))
+                    ev = redact(m.group(0))
+                    if pid != "private-key":
+                        note = _pattern_hint(m.group(0), line[:m.start()])
+                        if note:  # v0.4.1: AWS docs key / masked xoxb-xxxx… / form placeholder
+                            sev = "low"
+                            ev += " (%s)" % note
+                    add("secret", sev, rel, lineno, summary=desc + " detected", evidence=ev)
             gm = GENERIC.search(line)
             if gm and re.match(r"^(https?|wss?)://", gm.group(2), re.I):
                 gm = None  # `OAUTH2_TOKEN = "https://…"` is an endpoint URL, not a credential (v0.4)
             if gm:
-                sev, note = _generic_sev(gm.group(2))
+                sev, note = _generic_sev(gm.group(2), line[:gm.start(2)])
                 ev = redact(gm.group(2))
                 if note:
                     ev += " (%s)" % note
@@ -540,11 +606,14 @@ def scan_config(root, files, add):
 # only with --triage. This automates the hand-triage done on the first $49
 # fulfilment dry run (mealie, 2026-10-05): fix-status action + secret FP filter.
 TEST_PATH_RE = re.compile(
-    r"(^|/)(tests?|__tests__|spec|specs|fixtures?|test-?data|testing|mocks?|examples?|"
-    r"samples?|demos?|e2e|cypress|\.github|docs?|stories|bench|benchmarks?|benchmark-apps)(/|$)", re.I)
+    r"(^|/)(__)?(tests?|spec|specs|fixtures?|test-?data|testing|test-?utils?|testutils?|mocks?|"
+    r"snapshots?|examples?|samples?|demos?|e2e|cypress|\.github|docs?|stories|bench|benchmarks?|"
+    r"benchmark-apps)(__)?(/|$)", re.I)  # v0.4.1: __fixtures__/__mocks__/testutils (sentry) join
 TEST_FILE_RE = re.compile(
-    r"(\.(test|spec|stories)\.[a-z0-9]+$|_test\.[a-z0-9]+$|^test_|^conftest\.py$|"
+    r"(\.(test|spec|stories)\.[a-z0-9]+$|_test\.[a-z0-9]+$|^test_|^test-?utils?\.|^conftest\.py$|"
     r"\.(example|sample|template|dist)$)", re.I)
+# v0.4.1: translation catalogues (`config/locales/server.ja.yml: password: "…"`) are UI copy
+LOCALE_PATH_RE = re.compile(r"(^|/)(locales?|i18n|lang|langs|translations?|l10n)(/|$)", re.I)
 
 
 def _secret_false_positive(f):
@@ -553,11 +622,16 @@ def _secret_false_positive(f):
     base = path.rsplit("/", 1)[-1]
     m = TEST_PATH_RE.search(path)
     if m:
-        return True, "in a test/fixture/example path (%s)" % m.group(2).lower()
+        return True, "in a test/fixture/example path (%s)" % m.group(3).lower()
     if TEST_FILE_RE.search(base):
         return True, "filename marks it as a test/example/template"
-    if "placeholder?" in (f.get("evidence") or ""):
-        return True, "value looks like a placeholder, not a real secret"
+    m = LOCALE_PATH_RE.search(path)
+    if m:
+        return True, "in a localization path (%s): translated UI text, not a credential" % m.group(2).lower()
+    ev = f.get("evidence") or ""
+    for note, reason in VALUE_HINTS.items():  # written by scan_secrets at detection time
+        if "(%s)" % note in ev:
+            return True, reason
     return False, None
 
 
@@ -606,7 +680,7 @@ def triage_findings(findings):
                 t["scaffold"] = True
                 t["priority"] = "low"
                 t["reason"] = ("lockfile under a %s path: example/fixture/benchmark scaffold, "
-                               "not the shipped dependency graph" % m.group(2).lower())
+                               "not the shipped dependency graph" % m.group(3).lower())
             if lock.endswith("go.sum"):
                 t["note"] += (" Source is go.sum without a go.mod beside it: go.sum also lists "
                               "superseded module versions; confirm with govulncheck.")

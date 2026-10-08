@@ -49,6 +49,26 @@ secret false-positive rule. Re-scan with v0.4.0: traefik 318 → 19 vulnerable r
 included), storybook 0 → 3,549 packages resolved / 130 vulnerable rows. The numbers in `SUMMARY.md` are the v0.3 run and
 are kept as-is.
 
+**Status (v0.4.1, same day):** item 6's second secret heuristic is shipped. Reading the actual lines behind the 313
+review-set rows showed the dominant leftovers were not test keys but *value shapes*: template/env references
+(`={{$credentials.apiKey}}`, `$__env{…}`, `#{…}`, `var(--…)`), translated UI strings in `config/locales/`, syntax-highlighter
+scope names (`token: 'entity.other.inherited-class'`), digit-less identifier strings (`ATTR_TOKEN = "long_lived_access_token"`),
+AWS/Slack examples inside form `placeholder=` attributes, and `grafana/…/test-data/` paths. v0.4.1 tags those in the evidence
+and `--triage` clears them. Re-scan of the six repos that held 297 of the 313 rows, same commits:
+
+| repo | review-set v0.3 | v0.4.1 | cleared mostly by |
+| --- | ---: | ---: | --- |
+| n8n | 83 | 17 | `={{$credentials…}}` expressions (53), test paths/filenames (12) |
+| home-assistant | 66 | 9 | URL values (v0.4), word-like constants (31) |
+| grafana | 62 | 3 | `test-data/` path (38), dotted flag names (18) |
+| vue core | 38 | 0 | highlighter scope names (38) |
+| discourse | 33 | 5 | `config/locales/` (26) |
+| sentry | 15 | 3 | `testutils/`, `__fixtures__`, AWS/Slack example values |
+| **total** | **297** | **37** | |
+
+What survives is the right residue: vendor API keys embedded in integrations, a TOTP secret, an OAuth secret, dev defaults
+with digits. I still have not verified any of them as live and name none as such.
+
 1. **`go.sum` is not the build graph.** 1,100 of the 2,453 rows are Go. Checking each Go repo's top-level
    `go.mod` at the same commit: of 1,099 vulnerable `go.sum` rows across caddy/gitea/hugo/prometheus/grafana/traefik,
    only **10** are at a version the top-level `go.mod` requires (caveat: prometheus and grafana have nested modules;

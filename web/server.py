@@ -231,7 +231,7 @@ def triage_block(tsummary):
             + counts
             + "<p class=\"muted\">Deterministic interpretation layer: it classifies and "
               "prioritises the findings below (fix-status for dependency advisories, a "
-              "test-path/placeholder heuristic for secrets). It discovers nothing new and "
+              "path and value-shape heuristic for secrets). It discovers nothing new and "
               "adds no findings; the raw findings and <code>manifest_hash</code> are "
               "unchanged. The <a href=\"" + E(CTA_URL) + "\">paid audit</a> adds three "
               "independent AI review passes and reproduction of what the scanner "

@@ -29,7 +29,7 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.0
+- uses: project-feldspar-resources/feldspar-scan@v0.4.1
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -47,7 +47,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.0`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.1`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -123,8 +123,10 @@ and `manifest_hash` stay untouched:
 - `triage` — a map from finding `id` to an interpretation: for a `dependency-vuln`,
   `action` is `upgrade` (with `upgrade_to`) or `monitor`; for a `secret`,
   `likely_false_positive` is set true when the hit sits in a test/fixture/example/CI
-  path or a placeholder value, routing everything else to `review`; `config` findings
-  are `review`.
+  path, a translation-catalogue path (`locales/`, `i18n/`, …, v0.4.1), or carries a
+  value-shape tag (placeholder, expression, non-ASCII, dotted name, form placeholder,
+  example key — see the secret section), routing everything else to `review`;
+  `config` findings are `review`.
 
 This is purely deterministic prioritisation (fix-status + path-based false-positive
 classification). It never clears a secret found in real source — it flags it for a
@@ -183,6 +185,27 @@ The generic assignment rule is downgraded to **low** and the evidence is tagged
 `(placeholder?)` when the value matches
 `example|changeme|your[_-]|xxx|dummy|placeholder|<|${`.
 
+**Value-shape hints (v0.4.1).** The 2026-10-08 dataset showed that most secret hits
+surviving the path rule were not credentials at all, so the evidence now carries one
+of these tags and the raw severity drops to **low** when the *value* has a
+non-credential shape; `--triage` classifies the same tags as likely false positives:
+
+| tag | shape |
+| --- | --- |
+| `(expression?)` | template / env reference: `={{$credentials.x}}`, `${VAR}`, `$VAR`, `$__env{…}`, `{env:…}`, `#{…}`, `%{…}`, `<%…`, `var(--…)` |
+| `(non-ascii?)` | contains non-ASCII text (translated UI copy, `••••` masks) — credentials are ASCII |
+| `(dotted-name?)` | dotted identifier with no digits (`entity.other.inherited-class`, `grafana.someFlagToken`, hostnames) |
+| `(word-like?)` | letters, underscores and hyphens only, no digits (`ATTR_TOKEN = "long_lived_access_token"`, API field names, header names) — random credentials carry digits |
+| `(form-placeholder?)` | the match sits inside a form `placeholder=` attribute |
+| `(example-key?)` | fixed-pattern hit that is a documented example (`AKIAIOSFODNN7EXAMPLE`, GitHub's docs `ghp_…`) or an `xxxx…`/`0000…`/`****` masked value |
+
+Hints never delete a finding: the hit stays in `findings` with its tag, and a value
+that looks like a live credential (digits, mixed case, a bcrypt `$2b$…` hash, a JWT)
+keeps its original severity and routes to `review`. The known cost of `word-like?`
+is a digit-less dictionary password (`"correcthorsebatterystaple"`) being tagged low;
+it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mocks__`,
+`testutils/`, `test-utils/`, `snapshots/`, `testUtils.*`.
+
 ### 3. `config`
 
 * `.env` / `.env.*` committed with at least one `KEY=value` line — high.
@@ -201,8 +224,9 @@ All config checks listed above are implemented.
 * **Deterministic only.** Pure regex/parser matching plus OSV lookups. No LLM,
   no reachability analysis, no taint tracking.
 * **No false-positive review.** Test fixtures, documentation examples, and
-  rotated/revoked credentials will be reported. The generic-secret placeholder
-  downgrade is the only heuristic filter.
+  rotated/revoked credentials will be reported. The only heuristic filters are
+  the path rules and the value-shape hints (v0.4.1) described above; a committed
+  real credential with a plausible shape in a non-test path is never cleared.
 * **No git history scan.** Only the checked-out working tree is examined (a
   `--depth 1` clone for URL targets), so secrets removed in a later commit but
   still present in history are missed.
