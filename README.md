@@ -214,6 +214,15 @@ All config checks listed above are implemented.
 * Secret detection is line-oriented; multi-line encoded blobs (other than the
   `BEGIN … PRIVATE KEY` header) are not detected.
 
+## Datasets
+
+Published runs of this scanner over sets of public repositories, with pinned commits and the
+scripts to reproduce them, live under [`datasets/`](datasets/):
+
+* [`2026-10-08-popular-oss`](datasets/2026-10-08-popular-oss/) — 25 popular repos across npm,
+  PyPI, Go, crates.io and RubyGems; what the raw counts get wrong (`go.sum` ghosts, fixture
+  lockfiles, unknown severities, secret-regex noise) and the scanner fixes that follow from it.
+
 ## Beyond this scanner
 
 The paid tier is a three-pass AI review with reproduction of what pattern
