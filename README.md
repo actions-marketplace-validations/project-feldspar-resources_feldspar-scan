@@ -29,7 +29,7 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.3.1
+- uses: project-feldspar-resources/feldspar-scan@v0.4.0
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -47,7 +47,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.3.1`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.0`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -208,8 +208,18 @@ All config checks listed above are implemented.
   still present in history are missed.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
-* Yarn v2+/Berry (`yarn.lock` YAML format), `composer.lock`, Maven/Gradle,
-  NuGet, and `go.mod`-only repos are not parsed.
+* Go: `go.mod`'s `require` set (direct + indirect) is the build list and is what
+  gets queried; `go.sum` is only read when no `go.mod` sits beside it, because it
+  also records superseded module versions (v0.4 — the 2026-10-08 dataset showed
+  99% of `go.sum` hits were not in `go.mod`). No call-graph reachability: use
+  `govulncheck` for that.
+* Yarn v1 and Yarn Berry (v2+) lockfiles are parsed (Berry since v0.4; workspace/
+  patch/portal entries are skipped). `composer.lock`, Maven/Gradle and NuGet are not.
+* `summary.lockfiles_parsed` lists what was actually read; when nothing was,
+  `summary.notes` says so — a zero is not "clean". Dependency hits whose lockfile
+  sits under a test/fixture/example/benchmark path are tagged `scaffold` by
+  `--triage` (low priority), and a package listed in both a fixture and a shipped
+  lockfile is attributed to the shipped one.
 * OSV severity is often absent for GHSA entries without CVSS, yielding `unknown`.
 * Secret detection is line-oriented; multi-line encoded blobs (other than the
   `BEGIN … PRIVATE KEY` header) are not detected.

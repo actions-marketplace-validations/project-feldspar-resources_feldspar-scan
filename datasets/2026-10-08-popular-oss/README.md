@@ -41,6 +41,14 @@ Raw per-repo JSON is not committed (≈ 30 MB); `run_dataset.sh` recreates it in
 
 ## What the raw counts get wrong (also this scanner's own bug list)
 
+**Status (v0.4.0, same day):** items 1, 2, 3 and the URL part of 6 are fixed in v0.4.0 — `go.mod` is preferred over
+`go.sum`, Yarn Berry lockfiles parse, scaffold lockfiles are tagged by `--triage` (and a package listed in both a fixture
+and a shipped lockfile is attributed to the shipped one), `summary.lockfiles_parsed` + `summary.notes` make a zero
+legible, URL values are no longer reported as secrets, and `test-data` / `bench*` / `*.stories.*` paths join the
+secret false-positive rule. Re-scan with v0.4.0: traefik 318 → 19 vulnerable rows (from `go.mod`, nested modules
+included), storybook 0 → 3,549 packages resolved / 130 vulnerable rows. The numbers in `SUMMARY.md` are the v0.3 run and
+are kept as-is.
+
 1. **`go.sum` is not the build graph.** 1,100 of the 2,453 rows are Go. Checking each Go repo's top-level
    `go.mod` at the same commit: of 1,099 vulnerable `go.sum` rows across caddy/gitea/hugo/prometheus/grafana/traefik,
    only **10** are at a version the top-level `go.mod` requires (caveat: prometheus and grafana have nested modules;

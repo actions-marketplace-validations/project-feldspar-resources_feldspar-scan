@@ -12,6 +12,13 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                   as upgrade (patch available) or monitor (no patched release yet).
                   Discovers nothing and adds no findings, so the raw findings set and
                   manifest_hash are unchanged; triage is a separate, additive section.
+                  v0.4: dependency hits from lockfiles under test/fixture/example/benchmark
+                  paths are tagged scaffold (low priority).
+
+v0.4 (2026-10-08, from the 25-repo dataset in datasets/): go.mod is the Go build list and is
+preferred over go.sum (which lists superseded versions too); Yarn Berry lockfiles are parsed;
+`summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed; URL values
+are never reported as hardcoded secrets.
 """
 import hashlib
 import json
@@ -30,7 +37,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.3"
+VERSION = "0.4"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -40,10 +47,11 @@ BIN_EXT = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".zip", ".gz
            ".tgz", ".bz2", ".xz", ".7z", ".jar", ".class", ".so", ".dylib", ".dll",
            ".exe", ".woff", ".woff2", ".ttf", ".eot", ".mp3", ".mp4", ".wasm", ".pyc"}
 LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
-             "uv.lock", "Cargo.lock", "Gemfile.lock", "go.sum", "composer.lock"}
+             "uv.lock", "Cargo.lock", "Gemfile.lock", "go.sum", "go.mod", "composer.lock"}
 MAX_TEXT = 1024 * 1024
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 ERRORS = []
+PARSED_LOCKFILES = []   # relative paths of dependency manifests actually parsed (v0.4; summary.lockfiles_parsed)
 
 
 # ---------------------------------------------------------------- utilities
@@ -156,10 +164,19 @@ def parse_package_lock(text):
     return out
 
 
+YARN_SKIP_PROTOCOLS = {"workspace", "patch", "portal", "link", "file", "exec", "git", "github", "http", "https"}
+
+
 def parse_yarn_lock(text):
+    """Yarn v1 (`name@^1.0.0:` / `  version "1.0.0"`) and Yarn Berry v2+ (`"name@npm:^1.0.0":` /
+    `  version: 1.0.0`, `__metadata:` header). Workspace/patch/portal entries are not registry packages
+    and are skipped (v0.4 — before this, Berry lockfiles silently yielded 0 packages)."""
     out = []
     names = []
     for line in text.splitlines():
+        if line.startswith("__metadata"):
+            names = []
+            continue
         if line and not line.startswith((" ", "\t", "#")) and line.rstrip().endswith(":"):
             names = []
             spec = line.rstrip()[:-1]
@@ -169,12 +186,18 @@ def parse_yarn_lock(text):
                     continue
                 at = part.rfind("@")
                 if at > 0:
+                    rng = part[at + 1:]
+                    proto = rng.split(":", 1)[0] if ":" in rng else None
+                    if proto in YARN_SKIP_PROTOCOLS:
+                        continue
                     names.append(part[:at])
         else:
-            m = re.match(r'^\s+version\s+"?([^"\s]+)"?', line)
+            m = re.match(r'^\s+version:?\s+"?([^"\s]+)"?', line)
             if m and names:
-                for n in dict.fromkeys(names):
-                    out.append(("npm", n, m.group(1)))
+                ver = m.group(1)
+                if re.match(r"^\d", ver):
+                    for n in dict.fromkeys(names):
+                        out.append(("npm", n, ver))
                 names = []
     return out
 
@@ -205,6 +228,9 @@ def parse_pnpm_lock(text):
 
 
 def parse_go_sum(text):
+    """go.sum lists EVERY module version the module graph ever touched, including superseded ones
+    (dataset 2026-10-08: 1,089 of 1,099 vulnerable go.sum rows were not in go.mod). It is only used
+    when no go.mod sits beside it (v0.4); prefer parse_go_mod."""
     out = []
     for line in text.splitlines():
         parts = line.split()
@@ -215,6 +241,30 @@ def parse_go_sum(text):
             ver = ver[: -len("/go.mod")]
         if mod and ver.startswith("v"):
             out.append(("Go", mod, ver))
+    return out
+
+
+def parse_go_mod(text):
+    """The `require` set of go.mod = the module's build list (direct + `// indirect`, Go 1.17+)."""
+    out = []
+    in_req = False
+    for line in text.splitlines():
+        s = line.split("//", 1)[0].strip()
+        if not s:
+            continue
+        if s.startswith("require ("):
+            in_req = True
+            continue
+        if in_req and s == ")":
+            in_req = False
+            continue
+        m = None
+        if in_req:
+            m = re.match(r"^(\S+)\s+(v\S+)$", s)
+        elif s.startswith("require "):
+            m = re.match(r"^require\s+(\S+)\s+(v\S+)$", s)
+        if m:
+            out.append(("Go", m.group(1), m.group(2)))
     return out
 
 
@@ -244,12 +294,14 @@ DEP_HANDLERS = {
     "yarn.lock": parse_yarn_lock,
     "pnpm-lock.yaml": parse_pnpm_lock,
     "go.sum": parse_go_sum,
+    "go.mod": parse_go_mod,
     "Gemfile.lock": parse_gemfile_lock,
 }
 
 
 def collect_packages(root, files):
     seen = {}
+    gomod_dirs = {os.path.dirname(p) for p in files if os.path.basename(p) == "go.mod"}
     for path in files:
         base = os.path.basename(path)
         handler = DEP_HANDLERS.get(base)
@@ -257,6 +309,8 @@ def collect_packages(root, files):
             handler = parse_requirements
         if handler is None:
             continue
+        if base == "go.sum" and os.path.dirname(path) in gomod_dirs:
+            continue  # go.mod beside it is the build list; go.sum also records superseded versions
         text = read_text(path, 8 * 1024 * 1024)
         if text is None:
             continue
@@ -266,8 +320,14 @@ def collect_packages(root, files):
             ERRORS.append("parse %s: %s" % (os.path.relpath(path, root), exc))
             continue
         rel = os.path.relpath(path, root)
+        PARSED_LOCKFILES.append(rel)
+        scaffold = bool(TEST_PATH_RE.search(rel))
         for eco, name, ver in pkgs:
-            seen.setdefault((eco, name, ver), rel)
+            key = (eco, name, ver)
+            prev = seen.get(key)
+            # attribute a package@version to a shipped lockfile over a fixture/example one when both list it
+            if prev is None or (not scaffold and TEST_PATH_RE.search(prev)):
+                seen[key] = rel
     return seen
 
 
@@ -404,6 +464,8 @@ def scan_secrets(root, files, add):
                     add("secret", sev, rel, lineno, summary=desc + " detected",
                         evidence=redact(m.group(0)))
             gm = GENERIC.search(line)
+            if gm and re.match(r"^(https?|wss?)://", gm.group(2), re.I):
+                gm = None  # `OAUTH2_TOKEN = "https://…"` is an endpoint URL, not a credential (v0.4)
             if gm:
                 sev, note = _generic_sev(gm.group(2))
                 ev = redact(gm.group(2))
@@ -478,10 +540,10 @@ def scan_config(root, files, add):
 # only with --triage. This automates the hand-triage done on the first $49
 # fulfilment dry run (mealie, 2026-10-05): fix-status action + secret FP filter.
 TEST_PATH_RE = re.compile(
-    r"(^|/)(tests?|__tests__|spec|specs|fixtures?|testdata|mocks?|examples?|"
-    r"samples?|demos?|e2e|cypress|\.github|docs?|stories)(/|$)", re.I)
+    r"(^|/)(tests?|__tests__|spec|specs|fixtures?|test-?data|testing|mocks?|examples?|"
+    r"samples?|demos?|e2e|cypress|\.github|docs?|stories|bench|benchmarks?|benchmark-apps)(/|$)", re.I)
 TEST_FILE_RE = re.compile(
-    r"(\.(test|spec)\.[a-z0-9]+$|_test\.[a-z0-9]+$|^test_|^conftest\.py$|"
+    r"(\.(test|spec|stories)\.[a-z0-9]+$|_test\.[a-z0-9]+$|^test_|^conftest\.py$|"
     r"\.(example|sample|template|dist)$)", re.I)
 
 
@@ -499,12 +561,14 @@ def _secret_false_positive(f):
     return False, None
 
 
-def _triage_headline(up, mon, sec_review, sec_fp):
+def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0):
     parts = []
     if up:
         parts.append("%d dependency advisory/ies fixable by upgrade" % up)
     if mon:
         parts.append("%d dependency advisory/ies with no patch yet (monitor/mitigate)" % mon)
+    if scaffold:
+        parts.append("%d of the dependency hits are in example/fixture/benchmark lockfiles (low priority)" % scaffold)
     if sec_review:
         parts.append("%d secret hit(s) needing review" % sec_review)
     if sec_fp:
@@ -515,7 +579,7 @@ def _triage_headline(up, mon, sec_review, sec_fp):
 def triage_findings(findings):
     """Deterministic interpretation of the raw findings. Returns (per_id, summary)."""
     per_id = {}
-    dep_upgrade = dep_monitor = 0
+    dep_upgrade = dep_monitor = dep_scaffold = 0
     sec_total = sec_fp = 0
     for f in findings:
         cat = f["category"]
@@ -533,6 +597,19 @@ def triage_findings(findings):
                               "version, monitor the advisory, and apply any documented "
                               "mitigation. Not fixable by upgrade today.")}
                 dep_monitor += 1
+            lock = f.get("file") or ""
+            m = TEST_PATH_RE.search(lock)
+            if m:
+                # dataset 2026-10-08: react 546/618 and next.js 120/366 vulnerable rows came from
+                # lockfiles under fixtures/, tests/, benchmark dirs — scaffolds, not the shipped graph
+                dep_scaffold += 1
+                t["scaffold"] = True
+                t["priority"] = "low"
+                t["reason"] = ("lockfile under a %s path: example/fixture/benchmark scaffold, "
+                               "not the shipped dependency graph" % m.group(2).lower())
+            if lock.endswith("go.sum"):
+                t["note"] += (" Source is go.sum without a go.mod beside it: go.sum also lists "
+                              "superseded module versions; confirm with govulncheck.")
         elif cat == "secret":
             sec_total += 1
             is_fp, reason = _secret_false_positive(f)
@@ -549,10 +626,11 @@ def triage_findings(findings):
             t = {"action": "review"}
         per_id[f["id"]] = t
     summary = {
-        "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor},
+        "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
+                       "in_scaffold_lockfiles": dep_scaffold},
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
-        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp),
+        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp, dep_scaffold),
     }
     return per_id, summary
 
@@ -666,9 +744,16 @@ def main(argv):
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
+            "lockfiles_parsed": sorted(PARSED_LOCKFILES),
         },
         "findings": findings,
     }
+    if not PARSED_LOCKFILES:
+        # a zero must not read as "clean" (dataset 2026-10-08: 3 of 25 repos scanned 0 packages)
+        doc["summary"]["notes"] = [
+            "No supported dependency manifest was parsed, so dependency advisories were NOT assessed. "
+            "Supported: package-lock.json, yarn.lock (v1 + Berry), pnpm-lock.yaml, poetry.lock, uv.lock, "
+            "Cargo.lock, Gemfile.lock, go.mod (go.sum only without go.mod), requirements*.txt."]
     canon = json.dumps({"findings": findings, "target": target, "commit": commit},
                        sort_keys=True, separators=(",", ":"))
     doc["manifest_hash"] = hashlib.sha256(canon.encode()).hexdigest()
