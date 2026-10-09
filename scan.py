@@ -24,6 +24,9 @@ references, localized text, dotted identifier names, digit-less word-like values
 placeholders, documented example keys and masked values) tag the evidence `(hint?)`, drop the raw
 severity to low and are classified likely-false-positive by --triage; translation-catalogue paths
 (locales/, i18n/, …) and __fixtures__/__mocks__/testutils paths likewise.
+v0.4.2 (2026-10-08): Yarn Berry `pkg@patch:pkg@npm:…` / `workspace:` entries were split at the
+last "@", so the skip-protocol check never saw them and a bogus `pkg@patch:pkg` package was emitted;
+fixed (split after the scoped name). Regression tests in tests/ (python3 -m unittest discover -s tests).
 """
 import hashlib
 import json
@@ -42,7 +45,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -189,7 +192,10 @@ def parse_yarn_lock(text):
                 part = part.strip().strip('"')
                 if not part:
                     continue
-                at = part.rfind("@")
+                # split at the FIRST "@" after the (possibly @scoped/) name: a Berry
+                # `pkg@patch:pkg@npm:1.0#…` entry has several, and rfind took the last one,
+                # which hid the patch: protocol and emitted `pkg@patch:pkg` as a package (v0.4.2)
+                at = part.find("@", 1)
                 if at > 0:
                     rng = part[at + 1:]
                     proto = rng.split(":", 1)[0] if ":" in rng else None
