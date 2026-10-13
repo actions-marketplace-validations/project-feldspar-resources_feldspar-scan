@@ -264,11 +264,21 @@ scripts to reproduce them, live under [`datasets/`](datasets/):
 
 ## Beyond this scanner
 
-The paid tier is a three-pass AI review with reproduction of what pattern
-matching cannot see (auth and injection flaws, logic bugs, race conditions),
-$49 for repositories up to about 30k lines: <https://project-feldspar.com/>.
+The paid tier is a three-pass AI review of what pattern matching cannot see
+(auth and injection flaws, logic bugs, race conditions): the $49 Codebase Audit
+Report for repositories up to about 50k lines, and deep audits with reproductions
+from $149: <https://project-feldspar.com/> (prices plus any tax at checkout).
 Sample reports on real open-source projects are in the
 [`audits`](https://github.com/project-feldspar-resources/audits) repository.
+
+## Terms
+
+This scanner, the hosted scan at `/scan/`, its API, the MCP endpoint and this
+GitHub Action are free tools provided under section 2.5 of the L3Digital Standard
+Commercial Terms v1.0: <https://project-feldspar.com/terms/v1.0#s2-5> (as is, no
+warranty or support commitment; use them only on code you may lawfully scan).
+The code itself stays MIT-licensed (below). Privacy notice for the hosted
+service: <https://project-feldspar.com/privacy>.
 
 ## License
 

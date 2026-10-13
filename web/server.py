@@ -47,7 +47,9 @@ URL_RE = re.compile(
 )
 
 CTA_URL = "https://project-feldspar.com/"
-CTA_TEXT = "Want a real audit? $49 deep audit by three review passes"
+# PRO-92 (2026-10-13): wording aligned with the cleared offer on the order page (the $49 audit is the sample-depth pass
+# with three independent AI review passes; "deep audit" is the $149+ tier) — the old line called the $49 a "deep audit".
+CTA_TEXT = "Order the $49 codebase audit: three independent AI review passes"
 DISCLOSURE = ("This is an AI-operated service: the scan, this site and the "
               "follow-up audits are run by an autonomous agent (Project Feldspar).")
 
@@ -60,49 +62,26 @@ SEV_COLOR = {
     "moderate": "#a16207", "low": "#3f6212", "unknown": "#475569",
 }
 
+# PRO-92 (2026-10-13): the page shell and all base styles come from the site's brand stylesheet (/brand.css, served by
+# nginx from the same origin) and ops/site_shell.py in the workspace checkout. Only the scan-specific rules stay here.
 CSS = """
-:root{color-scheme:light dark}
-*{box-sizing:border-box}
-body{margin:0;padding:2.5rem 1.25rem;font:16px/1.55 -apple-system,BlinkMacSystemFont,
- "Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#111;background:#fbfbf9}
-main{max-width:60rem;margin:0 auto}
-h1{font-size:1.6rem;margin:0 0 .5rem;letter-spacing:-.01em}
-h2{font-size:1.1rem;margin:2rem 0 .5rem}
-p{margin:.6rem 0}
-.muted{color:#5b6470;font-size:.9rem}
-form{display:flex;gap:.5rem;flex-wrap:wrap;margin:1.25rem 0}
-input[type=text]{flex:1 1 24rem;padding:.6rem .7rem;font-size:1rem;
- border:1px solid #c8ccd2;border-radius:6px;background:#fff;color:#111}
-button{padding:.6rem 1.1rem;font-size:1rem;border:0;border-radius:6px;
- background:#1f2937;color:#fff;cursor:pointer}
-button:disabled{opacity:.55;cursor:progress}
-.cta{display:block;margin:1.75rem 0;padding:.9rem 1rem;border:1px solid #d8cfae;
- border-radius:8px;background:#fdf8e6;text-decoration:none;color:#111;font-weight:600}
-table{border-collapse:collapse;width:100%;font-size:.86rem;margin-top:.5rem}
-th,td{text-align:left;padding:.4rem .5rem;border-bottom:1px solid #e5e7eb;
- vertical-align:top;word-break:break-word}
-th{background:#f3f4f6;font-weight:600;white-space:nowrap}
-code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85em}
-.badge{display:inline-block;padding:.1rem .45rem;border-radius:4px;color:#fff;
- font-size:.75rem;font-weight:700;text-transform:uppercase;letter-spacing:.02em}
-.counts{display:flex;flex-wrap:wrap;gap:.4rem;margin:.6rem 0}
-.counts span{padding:.2rem .55rem;border:1px solid #e5e7eb;border-radius:999px;
- background:#fff;font-size:.85rem}
-details{margin:1.5rem 0}
-pre{overflow:auto;background:#0f172a;color:#e2e8f0;padding:.8rem;border-radius:6px;
- font-size:.78rem;max-height:28rem}
-.err{border-left:4px solid #b45309;padding:.5rem .8rem;background:#fff7ed}
-footer{margin-top:3rem;font-size:.85rem;color:#5b6470}
-a{color:#1d4ed8}
-@media (prefers-color-scheme:dark){
- body{background:#0f1115;color:#e6e8eb}
- input[type=text]{background:#1a1d23;color:#e6e8eb;border-color:#333a44}
- th{background:#1a1d23}th,td{border-color:#252a32}
- .counts span{background:#1a1d23;border-color:#252a32}
- .cta{background:#1e1b12;border-color:#4a4227;color:#e6e8eb}
- .err{background:#1e1b12}a{color:#93c5fd}
-}
+.results{max-width:none}
+.counts{display:flex;flex-wrap:wrap;gap:8px;margin:16px 0}
+.counts span{display:inline-block;padding:4px 8px;border-radius:2px;background:var(--l3-fill);font:400 .875rem/1.4 var(--l3-font-ui)}
+.meta{font:400 .875rem/1.7 var(--l3-font-ui)}
+.meta code{font-size-adjust:none}
+details{margin:32px 0}
+summary{font:600 1rem/1.5 var(--l3-font-ui);cursor:pointer}
+pre.raw{max-height:28rem;overflow:auto;margin-top:16px;padding:16px 24px;border-radius:2px;background:var(--l3-fill);font-size:.8125rem}
+td{word-break:break-word}
 """
+
+WS_OPS = os.path.join(os.path.dirname(os.path.dirname(SCANNER_DIR)), "..", "ops")  # <workspace>/ops
+sys.path.insert(0, os.path.abspath(WS_OPS))
+try:
+    import site_shell  # the shared shell (header, footer, favicons); same file the static pages use
+except Exception:  # pragma: no cover - a checkout without ops/ still serves scans, unbranded
+    site_shell = None
 
 E = html.escape
 
@@ -112,51 +91,67 @@ INDEX_DESCRIPTION = ("Free, deterministic security scan of a public GitHub, GitL
                      "triaged into fix-by-upgrade versus monitor, leaked-secret patterns with "
                      "likely false positives flagged, and config checks. No LLM, no sign-up.")
 INDEX_CANONICAL = "https://project-feldspar.com/scan/"
+# PRO-93 (2026-10-13): the free tools are provided under §2.5 of the L3Digital Standard Commercial Terms v1.0 (legal/README.md
+# "Free tools": the scan page, the API and MCP responses each link the Terms so §2.5 has a point of notice).
+TERMS_URL = "https://project-feldspar.com/terms/v1.0"
+TERMS_FREE = TERMS_URL + "#s2-5"
+TERMS_LINE = "Free tools are provided under section 2.5 of the L3Digital Standard Commercial Terms v1.0: " + TERMS_FREE
 
 
-def page(title, body, index=False):
-    # Only the landing page is indexable; scan results and error pages are
-    # per-request documents and stay noindex.
+def page(title, body, index=False, wide=False):
+    """Brand shell around `body` (which starts with its own page-title block).
+
+    Only the landing page is indexable; scan results and error pages are per-request documents and stay noindex.
+    """
+    tail = (f"<p class=\"muted small\">{E(DISCLOSURE)}</p>"
+            "<p class=\"muted small\"><a href=\"/scan/\">New scan</a> &middot; <a href=\"https://project-feldspar.com/privacy\">Privacy</a> &middot; "
+            f"<a href=\"{TERMS_FREE}\">Terms</a> (free tools: section 2.5 of the L3Digital Standard Commercial Terms v1.0)</p>")
+    content = f"<div class=\"content prose{' results' if wide else ''}\">{body}{tail}</div>"
+    if site_shell is not None:
+        return site_shell.page(title, content, description=INDEX_DESCRIPTION if index else None,
+                               canonical=INDEX_CANONICAL if index else None, current="/scan/",
+                               noindex=not index, extra_head=f"<style>{CSS}</style>")
     head = ("<meta name=\"robots\" content=\"noindex\">" if not index else
             f"<meta name=\"description\" content=\"{E(INDEX_DESCRIPTION)}\">"
             f"<link rel=\"canonical\" href=\"{INDEX_CANONICAL}\">")
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-            + head +
-            f"<title>{E(title)}</title><style>{CSS}</style></head>"
-            f"<body><main>{body}"
-            f"<footer><p>{E(DISCLOSURE)}</p>"
-            "<p><a href=\"/\">New scan</a></p></footer></main></body></html>")
+            + head + f"<title>{E(title)}</title><link rel=\"stylesheet\" href=\"/brand.css\"><style>{CSS}</style></head>"
+            f"<body><main id=\"main\" class=\"wrap\">{content}</main></body></html>")
+
+
+def title_block(heading, lede_html=""):
+    return (f"<div class=\"page-title\"><p class=\"eyebrow\">Feldspar · an autonomous AI agent</p><h1>{E(heading)}</h1>"
+            + (f"<p class=\"lede\">{lede_html}</p>" if lede_html else "") + "</div>")
 
 
 def cta_html():
-    return (f"<a class=\"cta\" href=\"{E(CTA_URL)}\">{E(CTA_TEXT)} &mdash; "
-            f"{E(CTA_URL)}</a>")
+    return (f"<p class=\"actions\"><a class=\"button\" href=\"{E(CTA_URL)}\">{E(CTA_TEXT)}</a>"
+            f"<span class=\"note\">Price plus any tax at checkout; the Terms and the scope ceiling are on the order page.</span></p>")
 
 
 def index_html():
     return page(
         "Free repository discovery scan — Project Feldspar",
-        "<h1>Free repository discovery scan</h1>"
-        "<p>Paste a public git repository URL and get a deterministic discovery "
-        "scan: dependency advisories resolved against "
-        "<a href=\"https://osv.dev/\">OSV.dev</a>, secret patterns in the "
-        "checked-out tree, and a handful of config checks (committed "
-        "<code>.env</code>, rootful Dockerfiles, GitHub Actions pwn-request "
-        "patterns). It is pure pattern matching and lockfile parsing &mdash; "
+        title_block("Free repository discovery scan",
+                    "Paste a public git repository URL and get a deterministic discovery scan: dependency advisories "
+                    "resolved against <a href=\"https://osv.dev/\">OSV.dev</a>, secret patterns in the checked-out tree, "
+                    "and a handful of config checks.")
+        + "<p>The config checks cover committed "
+        "<code>.env</code> files, rootful Dockerfiles and GitHub Actions pwn-request "
+        "patterns. It is pure pattern matching and lockfile parsing &mdash; "
         "no LLM is involved, and <strong>results are not reviewed for false "
         "positives</strong>, so test fixtures, docs examples and rotated "
         "credentials will show up.</p>"
-        "<form method=\"post\" action=\"scan\" id=\"f\">"
-        "<input type=\"text\" name=\"url\" required "
+        "<form method=\"post\" action=\"scan\" id=\"f\" class=\"form-row panel\">"
+        "<div class=\"field\"><label for=\"url\">Public git repository URL</label>"
+        "<input type=\"text\" name=\"url\" id=\"url\" required "
         "placeholder=\"https://github.com/owner/repo\" "
-        "pattern=\"https://(github\\.com|gitlab\\.com|codeberg\\.org|bitbucket\\.org)/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\\.git)?/?\" "
-        "aria-label=\"Public git repository URL\">"
+        "pattern=\"https://(github\\.com|gitlab\\.com|codeberg\\.org|bitbucket\\.org)/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(\\.git)?/?\"></div>"
         "<button type=\"submit\" id=\"b\">Scan</button></form>"
         "<p class=\"muted\">GitHub, GitLab, Codeberg and Bitbucket only. "
         "A shallow clone is made, scanned, and deleted. Scans take roughly "
         "10&ndash;90 seconds; 5 scans per hour per IP.</p>"
-        f"<p class=\"muted\">{E(DISCLOSURE)}</p>"
         "<p class=\"muted\">Automate it: <code>POST /scan/scan</code> with "
         "<code>url=</code> and <code>Accept: application/json</code> returns the raw "
         "report (<a href=\"https://project-feldspar.com/openapi.json\">OpenAPI</a>). "
@@ -173,15 +168,15 @@ def index_html():
 
 
 def message_page(title, heading, body_html, status_note=""):
-    return page(title, f"<h1>{E(heading)}</h1><div class=\"err\">{body_html}</div>"
+    return page(title, title_block(heading) + f"<div class=\"msg error\" role=\"alert\">{body_html}</div>"
                 + (f"<p class=\"muted\">{E(status_note)}</p>" if status_note else "")
                 + cta_html())
 
 
 def badge(sev):
+    # Brand badge: the word carries the meaning (ink on the fill); no per-severity colour.
     sev = (sev or "unknown").lower()
-    return (f"<span class=\"badge\" style=\"background:"
-            f"{SEV_COLOR.get(sev, SEV_COLOR['unknown'])}\">{E(sev)}</span>")
+    return f"<span class=\"badge\">{E(sev)}</span>"
 
 
 # Triage action -> display label + colour. The triage layer is deterministic
@@ -203,8 +198,7 @@ def triage_cell(t):
     elif action == "informational" and t.get("likely_false_positive"):
         label = "likely false positive"
     note = str(t.get("note") or t.get("reason") or "")
-    chip = (f"<span class=\"badge\" style=\"background:"
-            f"{TRIAGE_COLOR.get(action, TRIAGE_COLOR['review'])}\">{label}</span>")
+    chip = f"<span class=\"badge\">{label}</span>"
     return f"<span title=\"{E(note)}\">{chip}</span>" if note else chip
 
 
@@ -277,11 +271,12 @@ def results_html(doc):
             f"<td>{E(str(fixed))}</td>"
             f"<td><code>{E(str(f.get('evidence') or ''))}</code></td>"
             "</tr>")
-    table = ("<table><thead><tr><th>ID</th><th>Category</th><th>Severity</th>"
+    table = ("<div class=\"table-wrap\" role=\"region\" aria-label=\"Findings\" tabindex=\"0\">"
+             "<table><thead><tr><th>ID</th><th>Category</th><th>Severity</th>"
              "<th>Triage</th>"
              "<th>File:line</th><th>Package</th><th>Summary</th><th>Fixed in</th>"
              "<th>Evidence</th></tr></thead><tbody>"
-             + "".join(rows) + "</tbody></table>") if rows else \
+             + "".join(rows) + "</tbody></table></div>") if rows else \
             "<p>No findings. That is not a clean bill of health &mdash; see the " \
             "limits above.</p>"
     more = ""
@@ -292,14 +287,14 @@ def results_html(doc):
     errs = doc.get("errors") or []
     err_html = ""
     if errs:
-        err_html = ("<div class=\"err\"><strong>Degraded:</strong><ul>"
+        err_html = ("<div class=\"msg error\" role=\"alert\"><div><strong>Degraded.</strong><ul>"
                     + "".join(f"<li>{E(str(e))}</li>" for e in errs)
-                    + "</ul></div>")
+                    + "</ul></div></div>")
     raw = json.dumps(doc, indent=2, sort_keys=True)
     return page(
         "Scan results — Project Feldspar",
-        "<h1>Discovery scan results</h1>"
-        f"<p><strong>Target:</strong> <code>{E(target)}</code><br>"
+        title_block("Discovery scan results")
+        + f"<p class=\"meta\"><strong>Target:</strong> <code>{E(target)}</code><br>"
         f"<strong>Commit:</strong> <code>{E(commit)}</code><br>"
         f"<strong>Scanned at:</strong> <code>{E(scanned)}</code><br>"
         f"<strong>manifest_hash:</strong> <code>{E(str(doc.get('manifest_hash') or ''))}</code></p>"
@@ -311,7 +306,8 @@ def results_html(doc):
         + "<p class=\"muted\">Deterministic output only: no false-positive "
           "review, no git-history scan, no reachability analysis.</p>"
         + cta_html()
-        + f"<details><summary>Raw JSON</summary><pre>{E(raw)}</pre></details>")
+        + f"<details><summary>Raw JSON</summary><pre class=\"raw\">{E(raw)}</pre></details>",
+        wide=True)
 
 
 def _flatten_summary(summary, prefix=""):
@@ -415,7 +411,8 @@ MCP_INSTRUCTIONS = (
     "(Dockerfile, compose, GitHub workflows, .env, .npmrc). Limits: 5 scans per "
     "hour per client, 120 s per scan, no private repositories. Operated by an "
     "autonomous AI agent (Project Feldspar). For a paid human-readable deep audit "
-    "(three independent LLM review passes, verified findings) call audit_pricing.")
+    "(three independent LLM review passes, verified findings) call audit_pricing. "
+    + TERMS_LINE)
 MCP_TOOLS = [
     {
         "name": "scan_repository",
@@ -446,34 +443,43 @@ MCP_TOOLS = [
         "description": (
             "Describe Project Feldspar's paid code audit (security, correctness, "
             "maintainability; three independent AI review passes), its price, "
-            "delivery window, order terms and the checkout URL. No arguments."),
+            "delivery window, the Terms and the checkout URLs. No arguments."),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "destructiveHint": False,
                         "idempotentHint": True, "openWorldHint": False},
     },
 ]
 # PRO-80 (Legal and Compliance confirmation pass, 2026-10-13) 1-z: text matches projects/site/llms.txt — sample-depth $49,
-# 50k-line ceiling, 3 business days, deep tiers by quote, seller + AI disclosure, order terms. No "$99", no "24 hours".
+# 50k-line ceiling, 3 business days, seller + AI disclosure. PRO-93 (owner, 2026-10-13): L3Digital Standard Commercial Terms
+# v1.0 govern every order; the deep audits are self-serve products on their own payment links (legal/README.md "Two order
+# paths"); prices are shown plus any tax at checkout. No "$99", no "24 hours".
 AUDIT_PRICING_TEXT = (
-    "Project Feldspar paid code audit\n"
-    "- $49: sample-depth review (three independent AI review passes: security, "
-    "correctness, maintainability) of one public repository up to about 50k lines "
-    "that you own or are authorised to have reviewed, with file:line findings, "
-    "severity, evidence and a recommended fix; delivered by email within 3 business "
-    "days of payment and read access.\n"
-    "- Full-repository deep audits with reproductions: $149 / $349 / $699, scope and "
-    "price quoted by email before payment.\n"
+    "Project Feldspar paid code audits (prices in USD plus any tax, calculated at checkout)\n"
+    "- $49 Codebase Audit Report: sample-depth review (three independent AI review passes: "
+    "security, correctness, maintainability) of one public repository, or one service of a "
+    "monorepo, up to about 50k lines that you own or are authorised to have reviewed, with "
+    "file:line findings, severity, evidence and a recommended fix; delivered by email within "
+    "3 business days of payment and read access. Order: https://buy.stripe.com/fZu4gy0MRgTgfpl8Vc4c800\n"
+    "- Deep audits (full-repository security audit with reproductions where reachable and one "
+    "fix re-check within 30 days; delivered by email within 7 days of payment and read access): "
+    "$149 up to about 30k lines https://buy.stripe.com/3cI9AS3Z31Ym3GDdbs4c801 ; "
+    "$349 up to about 80k lines https://buy.stripe.com/5kQeVc8fjdH4gtp3AS4c802 ; "
+    "$699 larger or multi-service https://buy.stripe.com/eVq5kC1QV5ay5OLgnE4c803 . "
+    "Quotes, purchase orders, invoices or private repositories: sales@project-feldspar.com\n"
     "- Every order is checked before work starts (ownership or authorisation; "
-    "private repositories, personal data, non-US buyers and orders above $2,000 "
-    "need L3Digital's approval; MCP servers and agent tooling are not accepted).\n"
-    "- Seller: L3Digital LLC, trading as Project Feldspar; performed by Feldspar, an "
-    "autonomous AI agent; no person reviews the report. Order terms: "
-    "https://project-feldspar.com/#terms\n"
-    "- Order: https://buy.stripe.com/fZu4gy0MRgTgfpl8Vc4c800 (Stripe Checkout; "
-    "enter the public repository URL in the form). Public sample reports: "
+    "private repositories, personal data and orders above $2,000 need L3Digital's "
+    "approval; MCP servers and agent tooling are not accepted; a declined order is "
+    "refunded in full). The buyer receives an order confirmation with the Terms by email.\n"
+    "- Seller: L3Digital LLC, d/b/a Project Feldspar, 1143 E. Ireland Rd. #1173, South Bend, "
+    "IN 46614, United States; performed by Feldspar, an autonomous AI agent; no person reviews "
+    "the report. Terms: L3Digital Standard Commercial Terms v1.0, " + TERMS_URL + " (current "
+    "version always at https://project-feldspar.com/terms-of-service; consumer cancellation "
+    "information: " + TERMS_URL + "#schedule-b). Privacy notice: https://project-feldspar.com/privacy\n"
+    "- Product page and sample reports: https://project-feldspar.com/ and "
     "https://project-feldspar.com/samples/\n"
     "- Operator: an autonomous AI agent (Project Feldspar), disclosed as such. "
-    "Contact: feldspar@agentmail.to")
+    "Contact: feldspar@project-feldspar.com\n"
+    "- " + TERMS_LINE)
 
 
 def _rpc_error(rid, code, message, status=200):
@@ -551,6 +557,7 @@ def mcp_scan(url, ip):
         return _tool_text("Scan failed: " + err, True)
     findings = doc.get("findings") or []
     trimmed = dict(doc)
+    trimmed["terms"] = TERMS_FREE   # PRO-93: §2.5 point of notice in the MCP response
     if len(findings) > MCP_MAX_FINDINGS:
         trimmed["findings"] = findings[:MCP_MAX_FINDINGS]
         trimmed["truncated"] = {"shown": MCP_MAX_FINDINGS, "total": len(findings),
@@ -562,9 +569,9 @@ def mcp_scan(url, ip):
         triage_line = " Triage: %s (deterministic interpretation; see triage/triage_summary)." % \
                       tsummary["headline"]
     head = ("feldspar-scan %s of %s: %d finding(s). Summary: %s.%s Full JSON follows; "
-            "this is a deterministic discovery scan, not a security audit." % (
+            "this is a deterministic discovery scan, not a security audit. Terms: %s" % (
                 doc.get("version", MCP_SERVER_INFO["version"]), url, len(findings),
-                json.dumps(summary, sort_keys=True), triage_line))
+                json.dumps(summary, sort_keys=True), triage_line, TERMS_FREE))
     return {"content": [{"type": "text", "text": head},
                         {"type": "text", "text": json.dumps(trimmed, sort_keys=True)}],
             "structuredContent": trimmed, "isError": False}
@@ -811,6 +818,7 @@ class Handler(BaseHTTPRequestHandler):
 
             status = 200
             if as_json:
+                doc = {**doc, "terms": TERMS_FREE}   # PRO-93: §2.5 point of notice in the API response
                 self.send(200, json.dumps(doc, sort_keys=True) + "\n",
                           "application/json; charset=utf-8")
             else:
