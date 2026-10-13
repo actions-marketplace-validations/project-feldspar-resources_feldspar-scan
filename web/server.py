@@ -442,28 +442,33 @@ MCP_TOOLS = [
     },
     {
         "name": "audit_pricing",
-        "title": "Paid deep audit: scope, price, how to order",
+        "title": "Paid audit: scope, price, how to order",
         "description": (
             "Describe Project Feldspar's paid code audit (security, correctness, "
-            "maintainability; three independent review passes plus consolidation "
-            "and manual verification of every reported file:line), its price, "
-            "turnaround, and the Stripe checkout URL. No arguments."),
+            "maintainability; three independent AI review passes), its price, "
+            "delivery window, order terms and the checkout URL. No arguments."),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         "annotations": {"readOnlyHint": True, "destructiveHint": False,
                         "idempotentHint": True, "openWorldHint": False},
     },
 ]
+# PRO-80 (Legal and Compliance confirmation pass, 2026-10-13) 1-z: text matches projects/site/llms.txt — sample-depth $49,
+# 50k-line ceiling, 3 business days, deep tiers by quote, seller + AI disclosure, order terms. No "$99", no "24 hours".
 AUDIT_PRICING_TEXT = (
-    "Project Feldspar deep code audit\n"
-    "- Price: USD 49 for repositories up to about 30k lines of code; larger "
-    "repositories are quoted (typically USD 99) before any work starts.\n"
-    "- Scope: security, correctness and maintainability findings, each with "
-    "file:line, severity, evidence and a recommended fix; exploitable security "
-    "findings go to the maintainers privately first.\n"
-    "- Method: three independent review passes (security / correctness / "
-    "maintainability) over the source, a consolidation pass, then a manual "
-    "spot-check of every reported location by the agent before delivery.\n"
-    "- Turnaround: within 24 hours of payment; delivered by email as Markdown.\n"
+    "Project Feldspar paid code audit\n"
+    "- $49: sample-depth review (three independent AI review passes: security, "
+    "correctness, maintainability) of one public repository up to about 50k lines "
+    "that you own or are authorised to have reviewed, with file:line findings, "
+    "severity, evidence and a recommended fix; delivered by email within 3 business "
+    "days of payment and read access.\n"
+    "- Full-repository deep audits with reproductions: $149 / $349 / $699, scope and "
+    "price quoted by email before payment.\n"
+    "- Every order is checked before work starts (ownership or authorisation; "
+    "private repositories, personal data, non-US buyers and orders above $2,000 "
+    "need L3Digital's approval; MCP servers and agent tooling are not accepted).\n"
+    "- Seller: L3Digital LLC, trading as Project Feldspar; performed by Feldspar, an "
+    "autonomous AI agent; no person reviews the report. Order terms: "
+    "https://project-feldspar.com/#terms\n"
     "- Order: https://buy.stripe.com/fZu4gy0MRgTgfpl8Vc4c800 (Stripe Checkout; "
     "enter the public repository URL in the form). Public sample reports: "
     "https://project-feldspar.com/samples/\n"
