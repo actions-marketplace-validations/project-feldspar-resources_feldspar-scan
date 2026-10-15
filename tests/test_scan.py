@@ -675,6 +675,8 @@ class MalformedManifestTests(unittest.TestCase):
         for text in ['package=1', 'package="bad"', 'package=[1]', '[package]\nname="bad"',
                      '[[package]]\nname=["bad"]\nversion="1"',
                      '[[package]]\nname="bad"\nversion={bad=1}',
+                     '[[package]]\nname="bad"\nversion=true',
+                     '[[package]]\nname="bad"\nversion=123',
                      valid + '[[package]]\nname=["bad"]\nversion="1"',
                      valid + 'broken="', 'n=' + '9' * 10000,
                      'n=' + '[' * 2000 + '0' + ']' * 2000]:

@@ -73,6 +73,20 @@ class InputHandlingTests(unittest.TestCase):
             self.assertEqual(list(scan.walk(root, skipped)), [])
             self.assertEqual(skipped["non_regular"], 1)
 
+    def test_read_text_rejects_file_grown_past_limit_after_stat(self):
+        scan = load("hardening_scan_growth", "scan.py")
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "requirements.txt")
+            with open(path, "wb") as fh:
+                fh.write(b"demo==1.0\n")
+            limit = 8
+            stale_stat = mock.Mock(st_mode=os.stat(path).st_mode, st_size=limit)
+            with mock.patch.object(scan.os, "fstat", return_value=stale_stat):
+                self.assertIsNone(scan.read_text(path, limit=limit))
+            with open(path, "wb") as fh:
+                fh.write(b"x" * limit)
+            self.assertEqual(scan.read_text(path, limit=limit), "x" * limit)
+
     def test_html_escapes_package_and_triage_label(self):
         server = load("hardening_server", "web/server.py")
         doc = {"findings": [{"id": "F-001", "category": "dependency-vuln",

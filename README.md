@@ -36,7 +36,7 @@ To write a literal file named `-`, use `--json ./-`.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.7
+- uses: project-feldspar-resources/feldspar-scan@v0.4.8
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -54,7 +54,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.7`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.8`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -123,6 +123,13 @@ check `errors`, `summary.packages_found`, and `summary.lockfiles_parsed` for
 coverage. Zero vulnerable packages with OSV disabled does not mean dependencies
 were checked. This summary field does not affect `manifest_hash`.
 
+`summary.packages_by_ecosystem` counts unique `(ecosystem, name, version)` inventory
+entries for each observed ecosystem, in sorted ecosystem order. Its counts sum to
+`summary.packages_found`; duplicate entries across manifests count once, while
+different versions count separately. Empty inventory produces `{}`. These are
+inventory counts, including with `--no-osv`, not advisory counts or proof of a
+complete assessment. File limits bound this inventory; finding limits do not.
+
 `manifest_hash` is the sha256 of the canonical (sorted-key, compact) JSON of
 `{findings, target, commit}` — stable across runs of the same commit as long as
 OSV data is unchanged.
@@ -143,6 +150,14 @@ when scan limits truncate the report. A dependency finding may represent several
 advisories; the count is not the number of advisories. Zero dependency findings
 does not certify coverage (see `summary.osv_enabled` above). These counts do not
 affect `manifest_hash`.
+
+`summary.highest_severity` is the highest severity in the emitted findings,
+ordered `critical`, `high`, `medium`, `low`, then `unknown`. It is `unknown` when
+all findings are unrated and JSON `null` when no findings were emitted. It uses
+raw severity, unchanged by `--triage`; `unknown` never triggers `--fail-on`.
+Scan limits can omit more severe findings, and an empty report does not certify
+coverage. Check `summary.truncated`, `summary.osv_enabled`, notes and errors.
+This summary field does not affect `manifest_hash`.
 
 ### Triage (`--triage`)
 

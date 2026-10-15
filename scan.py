@@ -52,7 +52,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -111,7 +111,9 @@ def read_text(path, limit=MAX_TEXT):
             st = os.fstat(fh.fileno())
             if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
                 return None
-            raw = fh.read(limit)
+            raw = fh.read(limit + 1)
+            if len(raw) > limit:
+                return None
     except OSError:
         return None
     if b"\x00" in raw:
@@ -164,7 +166,7 @@ def parse_toml_packages(text, ecosystem):
                 return []
             n, v = pkg.get("name"), pkg.get("version")
             if n and v:
-                if not isinstance(n, str) or isinstance(v, (dict, list)):
+                if not isinstance(n, str) or not isinstance(v, str):
                     return []
                 out.append((ecosystem, n, str(v)))
         return out
@@ -589,7 +591,7 @@ SECRET_PATTERNS = [
      "critical", "Private key block"),
 ]
 GENERIC = re.compile(
-    r"""(?i)(?P<quote>['"]?)(?P<name>api[_-]?key|secret|password|passwd|token)(?P=quote)"""
+    r"""(?i)(?<![A-Za-z0-9])(?P<quote>['"]?)(?P<name>api[_-]?key|secret|password|passwd|token)(?P=quote)"""
     r"""\s*[:=]\s*['"](?P<value>[^'"\s]{16,})['"]""")
 PRIVATE_KEY_BLOCK = re.compile(
     r"^[ \t]*-----BEGIN (?P<label>[A-Z ]*PRIVATE KEY)-----[ \t]*\r?\n"
@@ -647,10 +649,9 @@ def scan_secrets(root, files, add):
                             match_sev = "low"
                             ev += " (%s)" % note
                     add("secret", match_sev, rel, lineno, summary=desc + " detected", evidence=ev)
-            gm = GENERIC.search(line)
-            if gm and re.match(r"^(https?|wss?)://", gm.group('value'), re.I):
-                gm = None  # `OAUTH2_TOKEN = "https://…"` is an endpoint URL, not a credential (v0.4)
-            if gm:
+            for gm in GENERIC.finditer(line):
+                if re.match(r"^(https?|wss?)://", gm.group('value'), re.I):
+                    continue  # Endpoint URLs are not credentials; check later assignments too.
                 sev, note = _generic_sev(gm.group('value'), line[:gm.start('value')])
                 ev = redact(gm.group('value'))
                 if note:
@@ -775,7 +776,7 @@ def scan_config(root, files, add):
                     break
         if base == "Dockerfile" or base.startswith("Dockerfile."):
             _scan_dockerfile(body(), rel, add)
-        if re.match(r"^docker-compose.*\.ya?ml$", base) or base == "compose.yml":
+        if re.match(r"^docker-compose.*\.ya?ml$", base) or base in ("compose.yml", "compose.yaml"):
             for lineno, line in enumerate(body().splitlines(), 1):
                 if re.fullmatch(r"\s*privileged:\s*true(?:\s+#.*)?\s*", line, re.I):
                     add("config", "medium", rel, lineno,
@@ -1136,6 +1137,10 @@ def main(argv):
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
 
+    packages_by_ecosystem = {}
+    for ecosystem, _, _ in sorted(pkgs):
+        packages_by_ecosystem[ecosystem] = packages_by_ecosystem.get(ecosystem, 0) + 1
+
     commit = git_head(root)
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
@@ -1145,11 +1150,13 @@ def main(argv):
             "files_with_findings": len({f["file"] for f in findings}),
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
+            "packages_by_ecosystem": packages_by_ecosystem,
             "vulnerable_packages": len(vulnerable),
             "osv_enabled": use_osv,
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
+            "highest_severity": findings[0]["severity"] if findings else None,
             "by_category": by_category,
             "lockfiles_parsed": sorted(PARSED_LOCKFILES),
             "truncated": {"findings": findings_truncated, "files": files_truncated},
