@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -211,6 +212,75 @@ class ScanSecretsTests(unittest.TestCase):
         self.assertNotIn("sk-9f8e7d6c", json.dumps(self.findings))
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", json.dumps(self.findings))
 
+    def test_provider_patterns_and_downgrades(self):
+        cases = [
+            ("GitLab personal access token", "high", "glpat-" + "aB3dE6gH9_-kL2nP5qR8",
+             "glpat-" + "x" * 20),
+            ("npm access token", "high", "npm_" + "aB3dE6gH9jK2" * 3,
+             "npm_" + "x" * 36),
+            ("OpenAI API key", "high", "sk-" + "aB3dE6gH9jK2" * 4,
+             "sk-" + "x" * 48),
+            ("OpenAI API key", "high", "sk-proj-" + "aB3dE6gH9_-K2" * 12,
+             "sk-proj-" + "x" * 156),
+            ("Anthropic API key", "high", "sk-ant-api03-" + "aB3dE6gH9_-K2" * 7,
+             "sk-ant-api03-" + "x" * 91),
+            ("Hugging Face token", "medium", "hf_" + "aB3dE6gH9jK2" * 2 + "mN4pQ7sT0v",
+             "hf_" + "x" * 34),
+            ("SendGrid API key", "high", "SG." + "aB3dE6gH9_-" * 2 + "." + "kL2nP5qR8_-" * 3 + "sT0vW3yZ6a",
+             "SG." + "x" * 22 + "." + "x" * 43),
+            ("Telegram bot token", "high", "123456789:" + "aB3dE6gH9_-" * 3 + "kL",
+             "123456789:" + "x" * 35),
+            ("Twilio API key SID", "medium", "SK" + "a1B2c3D4e5F60789" * 2,
+             "SK" + "0" * 32),
+        ]
+        for description, severity, value, masked in cases:
+            variants = [
+                (value, severity, None),
+                (masked, "low", "example-key?"),
+                ('<input placeholder="' + value + '">', "low", "form-placeholder?"),
+            ]
+            for text, want_severity, hint in variants:
+                with self.subTest(provider=description, prefix=value[:12], hint=hint):
+                    root = _tree({"src/credentials.txt": text + "\n"})
+                    findings = _collect(root, scan.scan_secrets)
+                    self.assertEqual(len(findings), 1, findings)
+                    f = findings[0]
+                    self.assertEqual(f["summary"], description + " detected")
+                    self.assertEqual(f["severity"], want_severity)
+                    if hint:
+                        self.assertIn("(%s)" % hint, f["evidence"])
+                    else:
+                        self.assertNotIn("(?)", f["evidence"])
+                        self.assertEqual(f["evidence"], value[:4] + "…")
+                    self.assertNotIn(value, json.dumps(findings))
+
+    def test_provider_patterns_reject_short_or_malformed_values(self):
+        values = [
+            "glpat-" + "aB3dE6gH9" * 2,  # 18 characters
+            "glpat-" + "a" * 21,
+            "npm_" + "a" * 35,
+            "npm_" + "a" * 37,
+            "sk-short", "sk-" + "a" * 39, "sk-proj-" + "a" * 39,
+            "sk-ant-" + "a" * 39,
+            "hf_" + "a" * 33,
+            "SG.short.segments",
+            "123456789:" + "a" * 34,
+            "123456789:" + "a" * 36,
+            "SK" + "a" * 31, "SK" + "a" * 33, "SK" + "g" * 32,
+            "sk_test_" + "aB3dE6gH9" * 6,
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                root = _tree({"src/credentials.txt": value + "\n"})
+                self.assertEqual(_collect(root, scan.scan_secrets), [])
+
+    def test_stripe_live_key_is_not_also_openai(self):
+        root = _tree({"src/credentials.txt": "sk_live_" + "aB3dE6gH9" * 6 + "\n"})
+        findings = _collect(root, scan.scan_secrets)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["summary"], "Stripe live secret key detected")
+        self.assertEqual(findings[0]["severity"], "critical")
+
 
 # ----------------------------------------------------------------- triage
 class TriageTests(unittest.TestCase):
@@ -312,6 +382,13 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(sorted(pkgs), [("Go", "github.com/a/b", "v1.0.0")])
         self.assertEqual(scan.PARSED_LOCKFILES, ["go.sum"])
 
+    def test_go_sum_skips_incomplete_or_extra_fields(self):
+        text = ("example.com/good v1.2.3 h1:abc=\n"
+                "example.com/missing-hash v2.0.0\n"
+                "example.com/extra v3.0.0 h1:abc= trailing\n"
+                "example.com/bad-hash v4.0.0 invalid\n")
+        self.assertEqual(scan.parse_go_sum(text), [("Go", "example.com/good", "v1.2.3")])
+
     def test_yarn_v1_and_berry(self):
         v1 = 'lodash@^4.17.0, lodash@^4.17.15:\n  version "4.17.21"\n  resolved "x"\n'
         self.assertEqual(scan.parse_yarn_lock(v1), [("npm", "lodash", "4.17.21")])
@@ -348,6 +425,118 @@ class LockfileTests(unittest.TestCase):
         root = _tree({"examples/demo/package-lock.json": lock})
         pkgs = scan.collect_packages(root, sorted(scan.walk(root)))
         self.assertEqual(pkgs[("npm", "react", "18.2.0")], "examples/demo/package-lock.json")
+
+
+class MalformedManifestTests(unittest.TestCase):
+    # Exercise every registered format, including all three TOML ecosystems.
+    VALID = {
+        "requirements.txt": ('demo==1.2.3\n', [("PyPI", "demo", "1.2.3")]),
+        "poetry.lock": ('[[package]]\nname="demo"\nversion="1.2.3"\n',
+                        [("PyPI", "demo", "1.2.3")]),
+        "uv.lock": ('[[package]]\nname="demo"\nversion="1.2.3"\n',
+                    [("PyPI", "demo", "1.2.3")]),
+        "Cargo.lock": ('[[package]]\nname="demo"\nversion="1.2.3"\n',
+                       [("crates.io", "demo", "1.2.3")]),
+        "package-lock.json": ('{"dependencies":{"demo":{"version":"1.2.3"}}}',
+                              [("npm", "demo", "1.2.3")]),
+        "yarn.lock": ('demo@^1.2.3:\n  version "1.2.3"\n', [("npm", "demo", "1.2.3")]),
+        "pnpm-lock.yaml": ('packages:\n  demo@1.2.3:\n    resolution: {}\n',
+                           [("npm", "demo", "1.2.3")]),
+        "go.sum": ('example.com/demo v1.2.3 h1:abc=\n', [("Go", "example.com/demo", "v1.2.3")]),
+        "go.mod": ('require example.com/demo v1.2.3\n', [("Go", "example.com/demo", "v1.2.3")]),
+        "Gemfile.lock": ('GEM\n  specs:\n    demo (1.2.3)\n', [("RubyGems", "demo", "1.2.3")]),
+    }
+
+    def test_all_parsers_malformed_and_valid(self):
+        self.assertEqual(set(self.VALID), set(scan.DEP_HANDLERS))
+        junk = ["", "\x00\xff\xfe", "unfinished\"", "[broken: {", "x" * (1024 * 1024),
+                "[" * 2000 + "]" * 2000]
+        for filename, (valid, expected) in self.VALID.items():
+            handler = scan.DEP_HANDLERS[filename]
+            with self.subTest(filename=filename, case="valid"):
+                self.assertEqual(handler(valid), expected)
+            for i, text in enumerate(junk):
+                with self.subTest(filename=filename, case=i):
+                    self.assertEqual(handler(text), [])
+            with self.subTest(filename=filename, case="valid prefix then junk"):
+                structured = filename == "package-lock.json" or (
+                    filename in ("poetry.lock", "uv.lock", "Cargo.lock") and scan.tomllib)
+                self.assertEqual(handler(valid + "\n[broken: {"), [] if structured else expected)
+
+    def test_truncated_tokens(self):
+        cases = {
+            "requirements.txt": "demo==",
+            "poetry.lock": '[[package]]\nname="demo"\nversion="',
+            "uv.lock": '[[package]]\nname="demo"\nversion="',
+            "Cargo.lock": '[[package]]\nname="demo"\nversion="',
+            "package-lock.json": '{"dependencies":{"demo":{"version":"',
+            "yarn.lock": 'demo@^1:\n  version "',
+            "pnpm-lock.yaml": "packages:\n  'demo@",
+            "go.sum": "example.com/demo",
+            "go.mod": "require example.com/demo",
+            "Gemfile.lock": "GEM\n  specs:\n    demo (",
+        }
+        for filename, text in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(scan.DEP_HANDLERS[filename](text), [])
+
+    def test_package_lock_invalid_shapes_and_limits(self):
+        for text in ['null', '[]', '42', '"text"', '{"packages": [null]}',
+                     '{"dependencies": {"demo": null}}',
+                     '{"packages":{"node_modules/demo":{"version":[1]}}}',
+                     '{"dependencies":{"demo":{"version":{"bad":1}}}}',
+                     '{"n":' + '9' * 10000 + '}',
+                     '{"x":' + '[' * 2000 + '0' + ']' * 2000 + '}']:
+            with self.subTest(text=text[:80]):
+                self.assertEqual(scan.parse_package_lock(text), [])
+        nested = '{"version":"1","dependencies":{"child":{"version":"2"}}}'
+        text = '{"dependencies":{"parent":' + nested + ',"sibling":{"version":"3"}}}'
+        self.assertEqual(scan.parse_package_lock(text),
+                         [("npm", "parent", "1"), ("npm", "child", "2"), ("npm", "sibling", "3")])
+
+    @unittest.skipUnless(scan.tomllib, "requires stdlib TOML decoder")
+    def test_toml_invalid_shapes_and_limits(self):
+        valid = self.VALID["poetry.lock"][0]
+        for text in ['package=1', 'package="bad"', 'package=[1]', '[package]\nname="bad"',
+                     '[[package]]\nname=["bad"]\nversion="1"',
+                     '[[package]]\nname="bad"\nversion={bad=1}',
+                     valid + '[[package]]\nname=["bad"]\nversion="1"',
+                     valid + 'broken="', 'n=' + '9' * 10000,
+                     'n=' + '[' * 2000 + '0' + ']' * 2000]:
+            with self.subTest(text=text[:80]):
+                self.assertEqual(scan.parse_toml_packages(text, "PyPI"), [])
+
+    def test_toml_fallback(self):
+        with mock.patch.object(scan, "tomllib", None):
+            valid, expected = self.VALID["poetry.lock"]
+            self.assertEqual(scan.parse_toml_packages(valid, "PyPI"), expected)
+            self.assertEqual(scan.parse_toml_packages(valid + 'broken="', "PyPI"), expected)
+            self.assertEqual(scan.parse_toml_packages('[[package]]\nname="', "PyPI"), [])
+
+    def test_decoder_logic_errors_are_not_swallowed(self):
+        with mock.patch.object(scan.json, "loads", side_effect=RuntimeError("bug")):
+            with self.assertRaises(RuntimeError):
+                scan.parse_package_lock("{}")
+        if scan.tomllib:
+            with mock.patch.object(scan.tomllib, "loads", side_effect=RuntimeError("bug")):
+                with self.assertRaises(RuntimeError):
+                    scan.parse_toml_packages("", "PyPI")
+
+    def test_bad_files_do_not_abort_collection(self):
+        self.addCleanup(_reset_globals)
+        for raw in [b"\x00\xff\xfe", b"\xff\xfe garbage", b"x" * (8 * 1024 * 1024 + 1)]:
+            with tempfile.TemporaryDirectory() as root:
+                _reset_globals()
+                for i, filename in enumerate(self.VALID):
+                    directory = os.path.join(root, str(i))
+                    os.mkdir(directory)  # keep go.sum separate from go.mod
+                    with open(os.path.join(directory, filename), "wb") as fh:
+                        fh.write(raw)
+                with open(os.path.join(root, "requirements.txt"), "w") as fh:
+                    fh.write("good==1.0\n")
+                self.assertEqual(scan.collect_packages(root, sorted(scan.walk(root))),
+                                 {("PyPI", "good", "1.0"): "requirements.txt"})
+                self.assertEqual(scan.ERRORS, [])
 
 
 # ---------------------------------------------------------------- the CLI

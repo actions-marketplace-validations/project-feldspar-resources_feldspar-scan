@@ -9,6 +9,7 @@ Routes:
     POST /scan     run a scan (form-encoded url= or JSON {"url": ...})
     GET  /healthz  liveness
     POST /mcp      Model Context Protocol (streamable-HTTP, stateless JSON-RPC)
+    POST /cancel/submit   online cancellation function (EU CRD Art. 11a): record + emailed acknowledgement
 
 Nothing here changes scan.py's behaviour: it is invoked as a subprocess
 exactly as documented, with TMPDIR pointed at a per-request temp dir so
@@ -19,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -83,6 +85,30 @@ try:
 except Exception:  # pragma: no cover - a checkout without ops/ still serves scans, unbranded
     site_shell = None
 
+# Google tag (PRO-123, 2026-10-14) for the no-shell fallback only; the primary path gets it from site_shell.head().
+# Keep in step with site_shell.ANALYTICS (same ids, same Consent Mode defaults, same European time-zone gate).
+GTAG_FALLBACK = (
+    # Consent Mode defaults first (GTM and the Google tag both read them); then, only for a browser NOT in a European time
+    # zone (PRO-124 A-1), the owner's GTM container GTM-N6V7ZXXJ (PRO-123 comment 8c93c19d), the Google tag and Clarity.
+    "<script>window.dataLayer = window.dataLayer || [];function gtag(){dataLayer.push(arguments);}"
+    "gtag('consent','default',{'ad_storage':'denied','ad_user_data':'denied','ad_personalization':'denied',"
+    "'analytics_storage':'denied','region':['AT','BE','BG','HR','CY','CZ','DK','EE','FI','FR','DE','GR','HU','IE','IT',"
+    "'LV','LT','LU','MT','NL','PL','PT','RO','SK','SI','ES','SE','IS','LI','NO','GB','CH','AX','GF','GP','MQ','RE','YT','MF']});"
+    "gtag('consent','default',{'ad_storage':'denied','ad_user_data':'denied','ad_personalization':'denied',"
+    "'analytics_storage':'granted'});gtag('js', new Date());"
+    "gtag('set',{'allow_google_signals':false,'allow_ad_personalization_signals':false});"
+    "gtag('config','G-WJDE88ELC6',{'allow_google_signals':false,'allow_ad_personalization_signals':false});"
+    "(function(w,d){var tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch(e){}"
+    "if(!tz||/^(Europe|Arctic|Etc)\\//.test(tz)||/^(UTC|UCT|GMT|Universal|Zulu)$/.test(tz)||"
+    "/^(Atlantic\\/(Canary|Madeira|Azores|Reykjavik|Faroe)|Africa\\/Ceuta|Asia\\/(Nicosia|Famagusta)|Indian\\/(Reunion|Mayotte)|"
+    "America\\/(Cayenne|Guadeloupe|Martinique|Marigot))$/.test(tz))return;"
+    "(function(w,d,s,l,i){w[l]=w[l]||[];w[l].push({'gtm.start':new Date().getTime(),event:'gtm.js'});"
+    "var f=d.getElementsByTagName(s)[0],j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;"
+    "j.src='https://www.googletagmanager.com/gtm.js?id='+i+dl;f.parentNode.insertBefore(j,f);})(w,d,'script','dataLayer','GTM-N6V7ZXXJ');"
+    "var g=d.createElement('script');g.async=true;g.src='https://www.googletagmanager.com/gtag/js?id=G-WJDE88ELC6';d.head.appendChild(g);"
+    "})(window,document);</script>")
+# Clarity is loaded by the GTM container (project yxodgqkial) since 2026-10-14 (W378); the direct snippet's project yxi1j2efx8 is gone (HTTP 204).
+
 E = html.escape
 
 
@@ -114,10 +140,17 @@ def page(title, body, index=False, wide=False):
     head = ("<meta name=\"robots\" content=\"noindex\">" if not index else
             f"<meta name=\"description\" content=\"{E(INDEX_DESCRIPTION)}\">"
             f"<link rel=\"canonical\" href=\"{INDEX_CANONICAL}\">")
+    # Share card (PRO-106); the primary path above uses site_shell.page() which emits the full OG/Twitter set.
+    head += ('<meta property="og:image" content="https://project-feldspar.com/brand/feldspar-share-card-1200x630.png">'
+             '<meta property="og:image:alt" content="Feldspar, by L3Digital">'
+             '<meta name="twitter:card" content="summary_large_image">'
+             '<meta name="twitter:image" content="https://project-feldspar.com/brand/feldspar-share-card-1200x630.png">')
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
-            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" + GTAG_FALLBACK
             + head + f"<title>{E(title)}</title><link rel=\"stylesheet\" href=\"/brand.css\"><style>{CSS}</style></head>"
-            f"<body><main id=\"main\" class=\"wrap\">{content}</main></body></html>")
+            '<body><noscript><iframe src="https://www.googletagmanager.com/ns.html?id=GTM-N6V7ZXXJ" height="0" width="0" '
+            'style="display:none;visibility:hidden"></iframe></noscript>'
+            f"<main id=\"main\" class=\"wrap\">{content}</main></body></html>")
 
 
 def title_block(heading, lede_html=""):
@@ -190,7 +223,7 @@ def triage_cell(t):
     if not t:
         return "<span class=\"muted\">&mdash;</span>"
     action = str(t.get("action") or "review")
-    label = action
+    label = E(action)
     if action == "upgrade" and t.get("upgrade_to"):
         up = t.get("upgrade_to")
         up = ", ".join(str(x) for x in up) if isinstance(up, (list, tuple)) else str(up)
@@ -253,7 +286,7 @@ def results_html(doc):
         if pkg and f.get("version"):
             pkg += "@" + str(f.get("version"))
         if pkg and f.get("ecosystem"):
-            pkg = f"{pkg} <span class=\"muted\">({E(str(f.get('ecosystem')))})</span>"
+            pkg = f"{E(pkg)} <span class=\"muted\">({E(str(f.get('ecosystem')))})</span>"
         else:
             pkg = E(pkg)
         fixed = f.get("fixed_in") or []
@@ -282,19 +315,25 @@ def results_html(doc):
     more = ""
     if len(findings) > MAX_ROWS:
         more = (f"<p class=\"muted\">Showing the first {MAX_ROWS} of "
-                f"{len(findings)} findings; the full set is in the raw JSON "
-                "below.</p>")
+                f"{len(findings)} findings; request the JSON route with POST /scan "
+                "for the full set.</p>")
     errs = doc.get("errors") or []
     err_html = ""
     if errs:
         err_html = ("<div class=\"msg error\" role=\"alert\"><div><strong>Degraded.</strong><ul>"
                     + "".join(f"<li>{E(str(e))}</li>" for e in errs)
                     + "</ul></div></div>")
-    raw = json.dumps(doc, indent=2, sort_keys=True)
+    shown = dict(doc)
+    if len(findings) > MAX_ROWS:
+        shown["findings"] = findings[:MAX_ROWS]
+        if "triage" in shown:
+            ids = {f.get("id") for f in shown["findings"]}
+            shown["triage"] = {k: v for k, v in shown["triage"].items() if k in ids}
+    raw = json.dumps(shown, indent=2, sort_keys=True)
     return page(
         "Scan results — Project Feldspar",
         title_block("Discovery scan results")
-        + f"<p class=\"meta\"><strong>Target:</strong> <code>{E(target)}</code><br>"
+        + f"<p class=\"meta\" data-clarity-mask=\"true\"><strong>Target:</strong> <code>{E(target)}</code><br>"
         f"<strong>Commit:</strong> <code>{E(commit)}</code><br>"
         f"<strong>Scanned at:</strong> <code>{E(scanned)}</code><br>"
         f"<strong>manifest_hash:</strong> <code>{E(str(doc.get('manifest_hash') or ''))}</code></p>"
@@ -345,6 +384,148 @@ def rate_refund(ip):
             _rate[ip].pop()
 
 
+# ------------------------------------------------------------------ cancellation function (PRO-96 W-1, 2026-10-13)
+# EU CRD Art. 11a (Directive (EU) 2023/2673, applying since 2026-06-19): an online consumer contract needs an online
+# "withdraw from contract here" function with a confirm step and an automatic acknowledgement on a durable medium that
+# states the content and the date and time of receipt. The static page /cancel (projects/site/cancel.html) posts here.
+# The record is VM 201's own continuing state (CANCEL_LOG); the acknowledgement goes to the buyer by email through the
+# Telnyx API with a copy to support@ (polled every run by routine_watch), so a cancellation is acted on the same run.
+CANCEL_LOG = os.environ.get("CANCEL_LOG", os.path.expanduser("~/work/cancellations/cancellations.jsonl"))
+CREDENTIALS_ENV = os.environ.get("FELDSPAR_CREDENTIALS_ENV", "/etc/feldspar/credentials.env")
+CANCEL_FROM = "support@project-feldspar.com"
+CANCEL_COPY_TO = "support@project-feldspar.com"
+CANCEL_FROM_NAME = "Feldspar (Project Feldspar, L3Digital LLC)"
+CANCEL_PAGE = "https://project-feldspar.com/cancel"
+EMAIL_RE = re.compile(r"^[^@\s]{1,100}@[^@\s]{1,100}\.[A-Za-z]{2,24}$")
+_cancel_lock = threading.Lock()
+
+
+def _credential(name):
+    """One value from the root-owned, group-readable credentials file (the service holds no secrets in its unit)."""
+    try:
+        with open(CREDENTIALS_ENV) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(name + "="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def cancel_validate(fields):
+    """form fields -> (record dict, error string)."""
+    def one(k, limit):
+        return " ".join(((fields.get(k) or [""])[0]).split())[:limit]
+    rec = {"name": one("name", 200), "order": one("order", 200), "email": one("email", 200),
+           "message": ((fields.get("message") or [""])[0]).strip()[:2000]}
+    if not rec["name"] or not rec["order"] or not rec["email"]:
+        return None, "Please give your name, the order (order number or the email you ordered with) and your email address."
+    if not EMAIL_RE.match(rec["email"]):
+        return None, "Please give a valid email address for the acknowledgement."
+    return rec, ""
+
+
+def cancel_ack_text(rec, when):
+    body = ("L3Digital LLC d/b/a Project Feldspar received your cancellation of order %s on %s.\n\n"
+            "Received from: %s <%s>\nOrder: %s\nYour message: %s\n\n"
+            "This email is the acknowledgement of receipt of your cancellation (Schedule B of the L3Digital Standard Commercial "
+            "Terms v1.0, https://project-feldspar.com/terms/v1.0#schedule-b). Please keep it.\n\n"
+            "What happens next: if work had not started, the full price is refunded; if you asked for an immediate start at "
+            "checkout and the work was under way, the refund is the price less a proportionate amount for the work done before "
+            "you cancelled; once the work is fully performed the right to cancel has ended. The refund goes to the payment method "
+            "you used, within 14 days. If anything about the order is unclear I will email you first.\n\n"
+            "Questions: reply to this email or write to support@project-feldspar.com.\n\n"
+            "Feldspar, the autonomous AI agent that runs Project Feldspar for L3Digital LLC (no person reviews this acknowledgement "
+            "before it is sent). L3Digital LLC d/b/a Project Feldspar, 1143 E. Ireland Rd. #1173, South Bend, IN 46614, United States.\n"
+            % (rec["order"], when, rec["name"], rec["email"], rec["order"], rec["message"] or "(none)"))
+    return body
+
+
+def _telnyx_send(key, to, subject, body, reply_to=CANCEL_FROM):
+    """POST one plain-text email through the Telnyx email API (stdlib only). Returns the Telnyx message id or ''."""
+    import urllib.request
+    import uuid
+    payload = json.dumps({"from": {"email": CANCEL_FROM, "name": CANCEL_FROM_NAME}, "to": [{"email": to}], "subject": subject,
+                          "text_body": body, "reply_to": {"email": reply_to, "name": CANCEL_FROM_NAME}}).encode("utf-8")
+    req = urllib.request.Request("https://api.telnyx.com/v2/email_messages", data=payload, method="POST",
+                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json",
+                                          "Accept": "application/json", "Idempotency-Key": str(uuid.uuid4())})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    return str(((data.get("data") or {}).get("id")) or "")
+
+
+def cancel_submit(rec, ip):
+    """Record the cancellation, email the acknowledgement (+ a copy to support@). Returns (record_id, when, ack_sent, note)."""
+    now = datetime.now(timezone.utc)
+    when = now.strftime("%Y-%m-%d %H:%M:%S UTC")
+    rid = now.strftime("CXL-%Y%m%d-%H%M%S-") + os.urandom(2).hex()
+    entry = {"id": rid, "received": now.isoformat(timespec="seconds"), "ip": ip, **rec, "ack_message_id": "", "copy_message_id": ""}
+    subject = "Cancellation received: order %s (%s)" % (rec["order"], rid)
+    body = cancel_ack_text(rec, when)
+    note = _cancel_record(entry)            # the record FIRST, whatever the mail gateway does next
+    key = _credential("TELNYX_API_KEY")
+    ack_sent = False
+    if key:
+        try:
+            entry["ack_message_id"] = _telnyx_send(key, rec["email"], subject, body)
+            ack_sent = bool(entry["ack_message_id"])
+        except Exception as e:   # noqa: BLE001 — the record is kept whatever the mail gateway does
+            note = "ack send failed: %s" % str(e)[:200]
+        try:
+            entry["copy_message_id"] = _telnyx_send(key, CANCEL_COPY_TO, "[CANCELLATION] " + subject,
+                                                    "Copy of the acknowledgement sent to %s (ack id %s, ip %s).\n\n%s"
+                                                    % (rec["email"], entry["ack_message_id"] or "NOT SENT", ip, body),
+                                                    reply_to=rec["email"])
+        except Exception as e:   # noqa: BLE001
+            note += (" " if note else "") + "copy send failed: %s" % str(e)[:200]
+    else:
+        note += (" " if note else "") + "no TELNYX_API_KEY readable: acknowledgement not emailed"
+    entry["note"] = note
+    note = _cancel_record({**entry, "stage": "sent"}) or note   # second line: the same id with the message ids + the final note
+    return rid, when, ack_sent, note
+
+
+def _cancel_record(entry):
+    """Append one JSON line to CANCEL_LOG; on any failure write the line to stdout (journald) instead and say so."""
+    line = json.dumps(entry, sort_keys=True)
+    try:
+        with _cancel_lock:
+            os.makedirs(os.path.dirname(CANCEL_LOG), exist_ok=True)
+            with open(CANCEL_LOG, "a") as fh:
+                fh.write(line + "\n")
+        return ""
+    except OSError as e:
+        sys.stdout.write("CANCELLATION-RECORD %s\n" % line)
+        sys.stdout.flush()
+        return "record file not writable (%s): record is in the service journal" % str(e)[:120]
+
+
+def cancel_error_html(heading, msg):
+    """A cancellation error page without the scan page's sales CTA."""
+    return page(heading + " — Project Feldspar",
+                title_block(heading) + "<div class=\"msg error\" role=\"alert\" data-clarity-mask=\"true\">%s</div>"
+                "<p><a href=\"%s\">Back to the cancellation form</a> · or email <a href=\"mailto:support@project-feldspar.com\">"
+                "support@project-feldspar.com</a>.</p>" % (E(msg), CANCEL_PAGE))
+
+
+def cancel_result_html(rec, rid, when, ack_sent):
+    status = (("An acknowledgement has been emailed to <strong>%s</strong>." % E(rec["email"])) if ack_sent else
+              ("The acknowledgement email could not be sent right now; your cancellation IS recorded under reference "
+               "<strong>%s</strong>. If no acknowledgement arrives within a day, write to support@project-feldspar.com quoting that reference." % E(rid)))
+    body = (title_block("Cancellation received",
+                        "L3Digital LLC d/b/a Project Feldspar received your cancellation on <strong>%s</strong>." % E(when)) +
+            "<div class=\"content prose\" data-clarity-mask=\"true\"><div class=\"card\"><ul>"
+            "<li><strong>Reference:</strong> %s</li><li><strong>Order:</strong> %s</li><li><strong>Name:</strong> %s</li>"
+            "<li><strong>Message:</strong> %s</li></ul><p>%s</p></div>"
+            "<p>Refunds follow Schedule B of the Terms (full refund if work had not started; proportionate if you asked for an "
+            "immediate start and the work was under way), to the payment method you used, within 14 days. "
+            "Questions: <a href=\"mailto:support@project-feldspar.com\">support@project-feldspar.com</a>.</p></div>"
+            % (E(rid), E(rec["order"]), E(rec["name"]), E(rec["message"] or "(none)"), status))
+    return page("Cancellation received — Project Feldspar", body)
+
+
 def run_scan(url):
     """Run scan.py in a disposable TMPDIR. Returns (doc, error_string)."""
     tmp = tempfile.mkdtemp(prefix="fds-web-")
@@ -357,12 +538,19 @@ def run_scan(url):
         env["HOME"] = env.get("HOME", tmp)
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_ASKPASS"] = "/bin/true"
+        env["FDS_CLONE_TIMEOUT"] = str(max(1, SCAN_TIMEOUT - 30))
+        proc = subprocess.Popen(
+            [sys.executable, SCAN_PY, url, "--json", out, "--triage"],
+            cwd=SCANNER_DIR, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, stdin=subprocess.DEVNULL, start_new_session=True)
         try:
-            proc = subprocess.run(
-                [sys.executable, SCAN_PY, url, "--json", out, "--triage"],
-                cwd=SCANNER_DIR, env=env, capture_output=True, text=True,
-                stdin=subprocess.DEVNULL, timeout=SCAN_TIMEOUT)
+            proc.communicate(timeout=SCAN_TIMEOUT)
         except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
             return None, ("The scan exceeded the %d second limit. Very large "
                           "repositories are out of scope for the free scan."
                           % SCAN_TIMEOUT)
@@ -460,7 +648,7 @@ AUDIT_PRICING_TEXT = (
     "monorepo, up to about 50k lines that you own or are authorised to have reviewed, with "
     "file:line findings, severity, evidence and a recommended fix; delivered by email within "
     "3 business days of payment and read access. Order: https://buy.stripe.com/fZu4gy0MRgTgfpl8Vc4c800\n"
-    "- Deep audits (full-repository security audit with reproductions where reachable and one "
+    "- Deep audits (full-repository security audit of a public GitHub or GitLab repository, with reproductions where reachable and one "
     "fix re-check within 30 days; delivered by email within 7 days of payment and read access): "
     "$149 up to about 30k lines https://buy.stripe.com/3cI9AS3Z31Ym3GDdbs4c801 ; "
     "$349 up to about 80k lines https://buy.stripe.com/5kQeVc8fjdH4gtp3AS4c802 ; "
@@ -468,7 +656,7 @@ AUDIT_PRICING_TEXT = (
     "Quotes, purchase orders, invoices or private repositories: sales@project-feldspar.com\n"
     "- Every order is checked before work starts (ownership or authorisation; "
     "private repositories, personal data and orders above $2,000 need L3Digital's "
-    "approval; MCP servers and agent tooling are not accepted; a declined order is "
+    "approval; MCP servers and agent tooling are not accepted; a deep audit's code must fit the tier ordered, else name a part that fits or get a full refund; a declined order is "
     "refunded in full). The buyer receives an order confirmation with the Terms by email.\n"
     "- Seller: L3Digital LLC, d/b/a Project Feldspar, 1143 E. Ireland Rd. #1173, South Bend, "
     "IN 46614, United States; performed by Feldspar, an autonomous AI agent; no person reviews "
@@ -562,6 +750,9 @@ def mcp_scan(url, ip):
         trimmed["findings"] = findings[:MCP_MAX_FINDINGS]
         trimmed["truncated"] = {"shown": MCP_MAX_FINDINGS, "total": len(findings),
                                 "full_report": "POST https://project-feldspar.com/scan/scan {\"url\": ...}"}
+        if "triage" in trimmed:
+            ids = {f.get("id") for f in trimmed["findings"]}
+            trimmed["triage"] = {k: v for k, v in trimmed["triage"].items() if k in ids}
     summary = doc.get("summary") or {}
     tsummary = doc.get("triage_summary") or {}
     triage_line = ""
@@ -743,6 +934,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/mcp":
                 status, target = self.handle_mcp()
                 return
+            if path == "/cancel/submit":
+                status = self.handle_cancel()
+                target = "cancel"
+                return
             if path not in ("/scan", "/scan/", "/"):
                 status = 404
                 self.fail(404, "Not found", "No such endpoint.", self.wants_json())
@@ -830,6 +1025,33 @@ class Handler(BaseHTTPRequestHandler):
             status = 500
         finally:
             self.access(status, started, target)
+
+    def handle_cancel(self):
+        """POST /cancel/submit (form-encoded, from the static /cancel page). Returns the status for the access log."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > 8192:
+            self.fail(413 if length > 8192 else 400, "Bad request", "The form was too large or malformed.", False)
+            return 413 if length > 8192 else 400
+        raw = self.rfile.read(length) if length else b""
+        fields = urllib.parse.parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+        rec, err = cancel_validate(fields)
+        if err:
+            self.send(400, cancel_error_html("Cancellation not sent", err))
+            return 400
+        ip = self.client_ip()
+        if not rate_check(ip):
+            self.send(429, cancel_error_html("Too many requests", "Please try again in an hour, or email support@project-feldspar.com."))
+            return 429
+        rid, when, ack_sent, note = cancel_submit(rec, ip)
+        sys.stdout.write("CANCELLATION %s order=%r email=%r ack=%s%s\n" % (rid, rec["order"][:80], rec["email"][:80],
+                                                                           "sent" if ack_sent else "NOT-SENT",
+                                                                           (" note=" + note) if note else ""))
+        sys.stdout.flush()
+        self.send(200, cancel_result_html(rec, rid, when, ack_sent))
+        return 200
 
     def _oops(self):
         """Generic 500. Traceback goes to our stdout, never to the client."""

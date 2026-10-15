@@ -3,7 +3,9 @@
 A small, deterministic, dependency-free repository scanner: **dependency advisories
 from [OSV.dev](https://osv.dev/), leaked-secret patterns, and a handful of config
 checks.** One Python 3.11+ file, standard library only. No LLM, no account, no
-telemetry, no network calls other than OSV.dev (and none at all with `--no-osv`).
+telemetry. A local-path scan contacts only OSV.dev for dependency lookups;
+`--no-osv` makes that local scan offline. Scanning a Git URL also clones
+the repository over the network, including with `--no-osv`.
 
 It is the free, open tier of [Project Feldspar](https://project-feldspar.com/), a
 codebase-audit service built and operated by Feldspar, an autonomous AI agent.
@@ -29,7 +31,7 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.2
+- uses: project-feldspar-resources/feldspar-scan@v0.4.4
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -47,7 +49,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.2`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.4`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -89,7 +91,10 @@ hosted form, the JSON API and `/mcp`, so you can self-host all three with `pytho
 
 Exit codes: `0` ok, `1` gate tripped (`--fail-on`), `2` bad args / bad path,
 `3` clone failed. Without `--fail-on`, a non-zero finding count does **not**
-change the exit code.
+change the exit code. An exit code of `0` means no severity gate fired; it
+does not certify a complete assessment. Review `errors`, `summary.notes`,
+`summary.lockfiles_parsed`, and `summary.packages_found` in the report.
+`--no-osv` skips dependency advisory lookups even when packages were parsed.
 
 ## Self-test
 
@@ -180,11 +185,21 @@ characters plus `…`.
 | `AKIA[0-9A-Z]{16}` (AWS access key id) | high |
 | `gh[pousr]_[A-Za-z0-9]{36,}` | high |
 | `github_pat_[A-Za-z0-9_]{80,}` | high |
+| `glpat-` + 20 URL-safe characters (GitLab personal access token) | high |
+| `npm_` + 36 alphanumerics (npm access token) | high |
+| `sk-` or `sk-proj-` + 40+ URL-safe characters (OpenAI; excludes `sk-ant-`) | high |
+| `sk-ant-` + 40+ URL-safe characters (Anthropic) | high |
+| `hf_` + 34+ alphanumerics (Hugging Face) | medium |
+| `SG.` + 22 URL-safe characters + `.` + 43 URL-safe characters (SendGrid) | high |
+| digits + `:` + 35 URL-safe characters (Telegram bot token) | high |
+| `SK` + 32 hex characters (Twilio API key SID) | medium |
 | `xox[baprs]-[0-9A-Za-z-]{10,}` (Slack) | high |
 | `sk_live_[0-9a-zA-Z]{24,}` (Stripe live) | critical |
 | `AIza[0-9A-Za-z_-]{35}` (Google API key) | medium |
 | `-----BEGIN … PRIVATE KEY-----` | critical |
 | generic `key/secret/password/token = "…16+ chars"` | medium |
+
+URL-safe characters above are `A-Z`, `a-z`, `0-9`, `_`, and `-`.
 
 The generic assignment rule is downgraded to **low** and the evidence is tagged
 `(placeholder?)` when the value matches
@@ -217,9 +232,15 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
 * `Dockerfile` with `ADD http(s)://…` — low.
 * `docker-compose*.yml` / `compose.yml` containing `privileged: true` — medium.
-* `.github/workflows/*.y(a)ml` using `pull_request_target` **and**
-  `actions/checkout` **and** `${{ github.event.pull_request.head` — high,
-  "pwn request pattern".
+* `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs
+  that are not full 40-character hexadecimal commit SHAs — low. Includes
+  `actions/*`; local `./` actions and `docker://` references are excluded.
+* Workflows triggered by `pull_request` with workflow/job `permissions:` declaring
+  `write-all` or a scope set to `write` — medium. This flags requested permissions;
+  job overrides, fork restrictions and repository policy can reduce actual access.
+* `pull_request_target` workflows where an `actions/checkout` step's `with.ref`
+  uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
+  `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
 * `.npmrc` / `.pypirc` containing `_authToken=` or a `password` line — high.
 
 All config checks listed above are implemented.
@@ -228,6 +249,13 @@ All config checks listed above are implemented.
 
 * **Deterministic only.** Pure regex/parser matching plus OSV lookups. No LLM,
   no reachability analysis, no taint tracking.
+* **Workflow checks are YAML heuristics**, limited to files directly in the scanned
+  root's `.github/workflows/`. They understand block mappings, step lists, scalar/
+  list/mapping event declarations and simple inline permission maps. Comments and
+  literal/folded script bodies are ignored. Anchors/aliases, general flow mappings
+  (including inline steps/checkout inputs), multiline quoted scalars and indirect
+  expressions are not resolved; these forms may be missed. These checks are review
+  prompts, not proof of exploitability or a complete workflow audit.
 * **No false-positive review.** Test fixtures, documentation examples, and
   rotated/revoked credentials will be reported. The only heuristic filters are
   the path rules and the value-shape hints (v0.4.1) described above; a committed
@@ -252,6 +280,28 @@ All config checks listed above are implemented.
 * OSV severity is often absent for GHSA entries without CVSS, yielding `unknown`.
 * Secret detection is line-oriented; multi-line encoded blobs (other than the
   `BEGIN … PRIVATE KEY` header) are not detected.
+
+## Dockerfile checks
+
+For `Dockerfile` and `Dockerfile.*`, config findings also cover:
+
+* `ADD` with an HTTP(S) source, including JSON operands and leading options — low.
+  URLs are omitted from evidence, including user info and query strings.
+* Shell-form `RUN` directly piping `curl` into `sh` or `bash` — medium.
+* `ENV`/`ARG` assignments with nonempty values and secret-like variable names
+  (for example `API_TOKEN`, `DB_PASSWORD`, `PRIVATE_KEY`, `AWS_SECRET_ACCESS_KEY`)
+  — high. Only names are reported. Unset arguments, empty values and plain
+  `$NAME`/`${NAME}` references are excluded; synthetic/default values may still
+  be flagged. This is a configuration warning, not credential validation.
+* `FROM` with an explicit `:latest` or no tag — low. Digest-pinned images,
+  `scratch`, prior build-stage names and variable-based references are excluded.
+
+These are bounded syntax heuristics. Continuations retain the first physical
+line number, comments and simple named heredoc bodies are skipped, and malformed
+quoted instructions are ignored. Heredoc scripts, exec-form shell commands,
+indirect pipelines, variable expansion, custom shells and full Dockerfile/shell
+grammar are not evaluated. The existing missing-`USER` check considers the whole
+file, not each stage. Findings are review prompts, not proof of a vulnerable build.
 
 ## Datasets
 
