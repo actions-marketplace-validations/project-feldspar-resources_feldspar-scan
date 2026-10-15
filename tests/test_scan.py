@@ -15,7 +15,9 @@ silently undo them:
   * summary.lockfiles_parsed / summary.notes, manifest_hash determinism, --triage additivity and
     the --fail-on gate on the committed test_fixture.
 """
+import contextlib
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -61,6 +63,43 @@ def _collect(root, fn):
 
     fn(root, sorted(scan.walk(root)), add)
     return out
+
+
+class AdvisorySummaryTests(unittest.TestCase):
+    def test_osv_mode_is_explicit_with_and_without_packages(self):
+        for has_packages in (False, True):
+            with self.subTest(has_packages=has_packages), tempfile.TemporaryDirectory() as root:
+                if has_packages:
+                    with open(os.path.join(root, "requirements.txt"), "w") as fh:
+                        fh.write("demo-package==1.2.3\n")
+                results = []
+                for enabled in (False, True):
+                    stdout = io.StringIO()
+                    args = ["scan.py", root] + ([] if enabled else ["--no-osv"])
+                    with mock.patch.object(scan, "query_osv", return_value={}) as query, \
+                            contextlib.redirect_stdout(stdout):
+                        self.assertEqual(scan.main(args), 0)
+                    result = json.loads(stdout.getvalue())
+                    self.assertIs(result["summary"]["osv_enabled"], enabled)
+                    self.assertEqual(result["summary"]["packages_found"], int(has_packages))
+                    self.assertEqual(result["summary"]["vulnerable_packages"], 0)
+                    self.assertEqual(query.call_count, int(enabled and has_packages))
+                    results.append(result)
+                self.assertEqual(results[0]["findings"], results[1]["findings"])
+                self.assertEqual(results[0]["manifest_hash"], results[1]["manifest_hash"])
+
+    def test_enabled_does_not_claim_successful_lookup(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "requirements.txt"), "w") as fh:
+                fh.write("demo-package==1.2.3\n")
+            stdout = io.StringIO()
+            with mock.patch.object(scan, "http_json", side_effect=OSError("offline fixture")), \
+                    contextlib.redirect_stdout(stdout):
+                self.assertEqual(scan.main(["scan.py", root]), 0)
+            result = json.loads(stdout.getvalue())
+            self.assertIs(result["summary"]["osv_enabled"], True)
+            self.assertTrue(result["errors"])
+            self.assertEqual(result["summary"]["vulnerable_packages"], 0)
 
 
 # ------------------------------------------------------------- value hints
@@ -254,6 +293,36 @@ class ScanSecretsTests(unittest.TestCase):
                         self.assertEqual(f["evidence"], value[:4] + "…")
                     self.assertNotIn(value, json.dumps(findings))
 
+    def test_aws_key_rejects_identifier_substrings(self):
+        value = "AKIA" + "A1B2C3D4E5F6G7H8"  # synthetic, never authenticated
+        for adjacent in ("A", "z", "0", "_"):
+            for text in (adjacent + value, value + adjacent):
+                with self.subTest(text=text):
+                    with tempfile.TemporaryDirectory() as root:
+                        path = os.path.join(root, "settings.txt")
+                        with open(path, "w") as fh:
+                            fh.write(text + "\n")
+                        self.assertEqual(_collect(root, scan.scan_secrets), [])
+
+    def test_aws_key_boundaries_preserve_delimited_findings(self):
+        value = "AKIA" + "A1B2C3D4E5F6G7H8"
+        for text in (value, '"' + value + '"', "'" + value + "'",
+                     "[" + value + "]", "id=" + value + "&region=test",
+                     " " + value + " ", "prefix-" + value + "-suffix"):
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory() as root:
+                    path = os.path.join(root, "settings.txt")
+                    with open(path, "w") as fh:
+                        fh.write("# synthetic fixture\n" + text + "\n")
+                    findings = _collect(root, scan.scan_secrets)
+                    self.assertEqual(len(findings), 1, findings)
+                    hit = findings[0]
+                    self.assertEqual(hit["summary"], "AWS access key ID detected")
+                    self.assertEqual(hit["severity"], "high")
+                    self.assertEqual(hit["line"], 2)
+                    self.assertEqual(hit["evidence"], "AKIA…")
+                    self.assertNotIn(value, json.dumps(findings))
+
     def test_provider_patterns_reject_short_or_malformed_values(self):
         values = [
             "glpat-" + "aB3dE6gH9" * 2,  # 18 characters
@@ -406,6 +475,14 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(scan.parse_yarn_lock('"@babel/core@^7.0.0", "@babel/core@^7.1.0":\n  version "7.1.2"\n'),
                          [("npm", "@babel/core", "7.1.2")])
 
+    def test_yarn_skips_truncated_version_and_continues(self):
+        text = ('broken@^1:\n  version "1.2.3\n'
+                'also-broken@^2:\n  version: 2.0.0 trailing\n'
+                'good@^3:\n  version "3.0.0"\n'
+                'berry@npm:^4:\n  version: 4.0.0\n')
+        self.assertEqual(scan.parse_yarn_lock(text),
+                         [("npm", "good", "3.0.0"), ("npm", "berry", "4.0.0")])
+
     def test_requirements_and_package_lock(self):
         self.assertEqual(scan.parse_requirements("requests==2.31.0  # pinned\nflask>=2\n-e .\n"
                                                  "urllib3[socks]==1.26.5; python_version<'3'\n"),
@@ -493,6 +570,22 @@ class MalformedManifestTests(unittest.TestCase):
         text = '{"dependencies":{"parent":' + nested + ',"sibling":{"version":"3"}}}'
         self.assertEqual(scan.parse_package_lock(text),
                          [("npm", "parent", "1"), ("npm", "child", "2"), ("npm", "sibling", "3")])
+
+    def test_package_lock_skips_non_string_versions_without_losing_siblings(self):
+        entries = {
+            "good": {"version": "1.2.3"},
+            "boolean": {"version": True},
+            "number": {"version": 2},
+            "object": {"version": {"bad": 1}},
+            "array": {"version": ["2"]},
+        }
+        for data in (
+            {"packages": {"node_modules/" + name: meta for name, meta in entries.items()}},
+            {"dependencies": entries},
+        ):
+            with self.subTest(format=next(iter(data))):
+                self.assertEqual(scan.parse_package_lock(json.dumps(data)),
+                                 [("npm", "good", "1.2.3")])
 
     @unittest.skipUnless(scan.tomllib, "requires stdlib TOML decoder")
     def test_toml_invalid_shapes_and_limits(self):

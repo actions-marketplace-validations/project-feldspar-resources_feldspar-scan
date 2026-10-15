@@ -31,7 +31,7 @@ so `manifest_hash` is unchanged with or without it.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.4
+- uses: project-feldspar-resources/feldspar-scan@v0.4.5
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -49,7 +49,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.4`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.5`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -112,6 +112,12 @@ committed `.env`. All three detectors should fire.
 Top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
 
+`summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
+lookups, and `true` otherwise. It records the selected mode, not lookup success:
+check `errors`, `summary.packages_found`, and `summary.lockfiles_parsed` for
+coverage. Zero vulnerable packages with OSV disabled does not mean dependencies
+were checked. This summary field does not affect `manifest_hash`.
+
 `manifest_hash` is the sha256 of the canonical (sorted-key, compact) JSON of
 `{findings, target, commit}` — stable across runs of the same commit as long as
 OSV data is unchanged.
@@ -120,6 +126,11 @@ Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
 Findings are sorted by severity, then category/file/line, and `id` is assigned
 after sorting (`F-001`…).
+
+`summary.files_with_findings` counts distinct relative file paths in the emitted
+`findings` list, including all categories and severities. Multiple findings in one
+file count once. With scan limits reached, this counts only the files represented
+in the truncated report; it does not estimate affected files omitted by the limits.
 
 ### Triage (`--triage`)
 
@@ -198,6 +209,7 @@ characters plus `…`.
 | `AIza[0-9A-Za-z_-]{35}` (Google API key) | medium |
 | `-----BEGIN … PRIVATE KEY-----` | critical |
 | generic `key/secret/password/token = "…16+ chars"` | medium |
+| Stripe live restricted key (`rk_live_` + 24+ alphanumeric characters) | high |
 
 URL-safe characters above are `A-Z`, `a-z`, `0-9`, `_`, and `-`.
 
@@ -242,6 +254,8 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
   uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
   `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
 * `.npmrc` / `.pypirc` containing `_authToken=` or a `password` line — high.
+  This configuration check skips full-line `#` and `;` comments (including
+  indented comments). Secret-pattern scanning still checks commented text.
 
 All config checks listed above are implemented.
 
@@ -295,6 +309,10 @@ For `Dockerfile` and `Dockerfile.*`, config findings also cover:
   be flagged. This is a configuration warning, not credential validation.
 * `FROM` with an explicit `:latest` or no tag — low. Digest-pinned images,
   `scratch`, prior build-stage names and variable-based references are excluded.
+* The last `USER` in the final stage explicitly sets `root` or UID `0`, optionally
+  with a literal group (`root:app`, `0:1000`) — low. Earlier stages and overridden
+  users are excluded. Variable-based users, inherited image users, and user-name
+  to UID mappings are not resolved; a root group alone does not trigger this check.
 
 These are bounded syntax heuristics. Continuations retain the first physical
 line number, comments and simple named heredoc bodies are skipped, and malformed

@@ -48,7 +48,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -201,10 +201,8 @@ def parse_package_lock(text):
                 name = key.rsplit("node_modules/", 1)[1]
             else:
                 continue
-            if name and ver:
-                if isinstance(ver, (dict, list)):
-                    return []
-                out.append(("npm", name, str(ver)))
+            if name and isinstance(ver, str) and ver:
+                out.append(("npm", name, ver))
     deps = data.get("dependencies")
     if isinstance(deps, dict) and not out:
         # Preserve depth-first order without consuming Python's call stack.
@@ -217,10 +215,8 @@ def parse_package_lock(text):
             name, meta = item
             if isinstance(meta, dict):
                 ver = meta.get("version")
-                if ver:
-                    if isinstance(ver, (dict, list)):
-                        return []
-                    out.append(("npm", name, str(ver)))
+                if isinstance(ver, str) and ver:
+                    out.append(("npm", name, ver))
                 if isinstance(meta.get("dependencies"), dict):
                     stack.append(iter(meta["dependencies"].items()))
     return out
@@ -257,9 +253,11 @@ def parse_yarn_lock(text):
                         continue
                     names.append(part[:at])
         else:
-            m = re.match(r'^\s+version:?\s+"?([^"\s]+)"?', line)
+            m = re.fullmatch(
+                r'\s+version:?\s+(?:"([^"\s]+)"|\'([^\'\s]+)\'|([^\s"\'#]+))\s*(?:#.*)?',
+                line)
             if m and names:
-                ver = m.group(1)
+                ver = next(group for group in m.groups() if group is not None)
                 if re.match(r"^\d", ver):
                     for n in dict.fromkeys(names):
                         out.append(("npm", n, ver))
@@ -548,7 +546,8 @@ def _generic_sev(match_value, line_prefix=""):
 
 
 SECRET_PATTERNS = [
-    ("aws-access-key-id", re.compile(r"AKIA[0-9A-Z]{16}"), "high", "AWS access key ID"),
+    ("aws-access-key-id", re.compile(r"(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}(?![A-Za-z0-9_])"),
+     "high", "AWS access key ID"),
     ("github-token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"), "high", "GitHub token"),
     ("github-pat", re.compile(r"github_pat_[A-Za-z0-9_]{80,}"), "high", "GitHub fine-grained PAT"),
     ("gitlab-pat", re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20}(?![A-Za-z0-9_-])"),
@@ -569,7 +568,10 @@ SECRET_PATTERNS = [
      "medium", "Twilio API key SID"),
     ("slack-token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}"), "high", "Slack token"),
     ("stripe-live-key", re.compile(r"sk_live_[0-9a-zA-Z]{24,}"), "critical", "Stripe live secret key"),
-    ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}"), "medium", "Google API key"),
+    ("stripe-restricted-key", re.compile(r"(?<![A-Za-z0-9_])rk_live_[0-9a-zA-Z]{24,}(?![A-Za-z0-9_])"),
+     "high", "Stripe live restricted key"),
+    ("google-api-key", re.compile(r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
+     "medium", "Google API key"),
     ("private-key", re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
      "critical", "Private key block"),
 ]
@@ -746,6 +748,8 @@ def scan_config(root, files, add):
             scan_workflow(body(), rel, add)
         if base in (".npmrc", ".pypirc"):
             for lineno, line in enumerate(body().splitlines(), 1):
+                if line.lstrip().startswith(("#", ";")):
+                    continue
                 if "_authToken=" in line or re.match(r"^\s*password\s*[:=]", line, re.I):
                     add("config", "high", rel, lineno,
                         summary="Credential committed in %s" % base,
@@ -796,7 +800,13 @@ def _scan_dockerfile(text, rel, add):
             summary='Dockerfile has no USER instruction (runs as root)',
             evidence='no USER directive')
     stages = set()
+    final_user = None
     for lineno, op, value in instructions:
+        if op == 'FROM':
+            final_user = None
+        elif op == 'USER':
+            final_user = (lineno, value.strip())
+
         def finding(severity, summary, evidence):
             add('config', severity, rel, lineno, summary=summary, evidence=evidence)
 
@@ -853,6 +863,11 @@ def _scan_dockerfile(text, rel, add):
                     command = []
                 else:
                     command.append(token)
+
+    if final_user and re.fullmatch(r'(?:root|0)(?::[A-Za-z0-9_.-]+)?', final_user[1]):
+        add('config', 'low', rel, final_user[0],
+            summary='Dockerfile final USER explicitly runs as root',
+            evidence='USER root or UID 0 (value omitted)')
 
 
 # ---------------------------------------------------------------- triage
@@ -1087,9 +1102,11 @@ def main(argv):
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "files_scanned": len(files),
+            "files_with_findings": len({f["file"] for f in findings}),
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
             "vulnerable_packages": len(vulnerable),
+            "osv_enabled": use_osv,
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
