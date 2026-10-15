@@ -36,7 +36,7 @@ To write a literal file named `-`, use `--json ./-`.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.6
+- uses: project-feldspar-resources/feldspar-scan@v0.4.7
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -54,7 +54,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.6`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.7`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -137,6 +137,13 @@ after sorting (`F-001`…).
 file count once. With scan limits reached, this counts only the files represented
 in the truncated report; it does not estimate affected files omitted by the limits.
 
+`summary.by_category` counts emitted findings for `dependency-vuln`, `secret`, and
+`config`, including zero counts. Its values sum to the length of `findings`, even
+when scan limits truncate the report. A dependency finding may represent several
+advisories; the count is not the number of advisories. Zero dependency findings
+does not certify coverage (see `summary.osv_enabled` above). These counts do not
+affect `manifest_hash`.
+
 ### Triage (`--triage`)
 
 With `--triage` the output gains two additive top-level keys and the raw findings
@@ -217,6 +224,10 @@ characters plus `…`.
 | generic `key/secret/password/token = "…16+ chars"` | medium |
 | Stripe live restricted key (`rk_live_` + 24+ alphanumeric characters) | high |
 
+Generic assignment keys may also be enclosed in paired single or double quotes,
+such as JSON's `"password": "…16+ chars"`. This is a line-based heuristic, not a
+JSON/YAML parser; the existing value exclusions and hint downgrades still apply.
+
 URL-safe characters above are `A-Z`, `a-z`, `0-9`, `_`, and `-`.
 
 Complete private-key blocks accept any uppercase/space label (including unlabelled
@@ -257,7 +268,10 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
 * `.env` / `.env.*` committed with at least one `KEY=value` line — high.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
 * `Dockerfile` with `ADD http(s)://…` — low.
-* `docker-compose*.yml` / `compose.yml` containing `privileged: true` — medium.
+* `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` containing a plain
+  `privileged: true` declaration — medium. This line-based heuristic allows trailing
+  comments, but ignores commented declarations, unrelated keys and longer scalar
+  values such as `trueish`; it does not parse general YAML structure.
 * `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs
   that are not full 40-character hexadecimal commit SHAs — low. Includes
   `actions/*`; local `./` actions and `docker://` references are excluded.

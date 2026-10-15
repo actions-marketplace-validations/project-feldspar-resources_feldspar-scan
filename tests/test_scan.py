@@ -550,6 +550,21 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(scan.parse_yarn_lock(text),
                          [("npm", "good", "3.0.0"), ("npm", "berry", "4.0.0")])
 
+    def test_pnpm_skips_truncated_quoted_keys_and_continues(self):
+        text = ("packages:\n"
+                "  'missing-close@1.0.0:\n"
+                "  missing-open@2.0.0':\n"
+                "  'quoted@3.0.0':\n"
+                "  plain@4.0.0:\n")
+        self.assertEqual(scan.parse_pnpm_lock(text),
+                         [("npm", "quoted", "3.0.0"), ("npm", "plain", "4.0.0")])
+
+    def test_yarn_malformed_header_does_not_reuse_previous_name(self):
+        text = ('stale@^1:\n  resolved "unused"\n'
+                'malformed@^2\n  version "2.0.0"\n'
+                'good@^3:\n  version "3.0.0"\n')
+        self.assertEqual(scan.parse_yarn_lock(text), [("npm", "good", "3.0.0")])
+
     def test_requirements_and_package_lock(self):
         self.assertEqual(scan.parse_requirements("requests==2.31.0  # pinned\nflask>=2\n-e .\n"
                                                  "urllib3[socks]==1.26.5; python_version<'3'\n"),

@@ -5,6 +5,9 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                [--fail-on SEV] [--triage]
 
   --json PATH     write JSON to PATH; use - for stdout (also the default).
+  --no-osv        skip OSV dependency advisory lookups;
+                  package inventory and local secret/config checks still run.
+                  URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
@@ -49,7 +52,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.6"
+VERSION = "0.4.7"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -236,8 +239,10 @@ def parse_yarn_lock(text):
         if line.startswith("__metadata"):
             names = []
             continue
-        if line and not line.startswith((" ", "\t", "#")) and line.rstrip().endswith(":"):
+        if line and not line.startswith((" ", "\t", "#")):
             names = []
+            if not line.rstrip().endswith(":"):
+                continue
             spec = line.rstrip()[:-1]
             for part in spec.split(","):
                 part = part.strip().strip('"')
@@ -277,10 +282,11 @@ def parse_pnpm_lock(text):
             in_pkgs = False
         if not in_pkgs:
             continue
-        m = re.match(r"^\s{2}'?(/?[^:'\s]+)'?:\s*$", line)
+        # A quoted key must have both quotes; a truncated key is not a package.
+        m = re.match(r"^\s{2}(?:'(/?[^:'\s]+)'|(/?[^:'\s]+)):\s*$", line)
         if not m:
             continue
-        key = m.group(1).lstrip("/")
+        key = (m.group(1) or m.group(2)).lstrip("/")
         key = key.split("(", 1)[0]
         at = key.rfind("@")
         if at <= 0:
@@ -551,8 +557,10 @@ def _generic_sev(match_value, line_prefix=""):
 SECRET_PATTERNS = [
     ("aws-access-key-id", re.compile(r"(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}(?![A-Za-z0-9_])"),
      "high", "AWS access key ID"),
-    ("github-token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"), "high", "GitHub token"),
-    ("github-pat", re.compile(r"github_pat_[A-Za-z0-9_]{80,}"), "high", "GitHub fine-grained PAT"),
+    ("github-token", re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36,}(?![A-Za-z0-9_])"),
+     "high", "GitHub token"),
+    ("github-pat", re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{80,}(?![A-Za-z0-9_])"),
+     "high", "GitHub fine-grained PAT"),
     ("gitlab-pat", re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20}(?![A-Za-z0-9_-])"),
      "high", "GitLab personal access token"),
     ("npm-token", re.compile(r"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"),
@@ -569,8 +577,10 @@ SECRET_PATTERNS = [
      "high", "Telegram bot token"),
     ("twilio-api-key-sid", re.compile(r"(?<![A-Za-z0-9_])SK[0-9a-fA-F]{32}(?![A-Za-z0-9_])"),
      "medium", "Twilio API key SID"),
-    ("slack-token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}"), "high", "Slack token"),
-    ("stripe-live-key", re.compile(r"sk_live_[0-9a-zA-Z]{24,}"), "critical", "Stripe live secret key"),
+    ("slack-token", re.compile(r"(?<![0-9A-Za-z_-])xox[baprs]-[0-9A-Za-z-]{10,}(?![0-9A-Za-z_-])"),
+     "high", "Slack token"),
+    ("stripe-live-key", re.compile(r"(?<![A-Za-z0-9_])sk_live_[0-9a-zA-Z]{24,}(?![A-Za-z0-9_])"),
+     "critical", "Stripe live secret key"),
     ("stripe-restricted-key", re.compile(r"(?<![A-Za-z0-9_])rk_live_[0-9a-zA-Z]{24,}(?![A-Za-z0-9_])"),
      "high", "Stripe live restricted key"),
     ("google-api-key", re.compile(r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
@@ -579,7 +589,8 @@ SECRET_PATTERNS = [
      "critical", "Private key block"),
 ]
 GENERIC = re.compile(
-    r"""(?i)(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['"]([^'"\s]{16,})['"]""")
+    r"""(?i)(?P<quote>['"]?)(?P<name>api[_-]?key|secret|password|passwd|token)(?P=quote)"""
+    r"""\s*[:=]\s*['"](?P<value>[^'"\s]{16,})['"]""")
 PRIVATE_KEY_BLOCK = re.compile(
     r"^[ \t]*-----BEGIN (?P<label>[A-Z ]*PRIVATE KEY)-----[ \t]*\r?\n"
     r"(?P<body>(?:[ \t]*[A-Za-z0-9+/=_.*-]+[ \t]*\r?\n)+)"
@@ -619,8 +630,7 @@ def scan_secrets(root, files, add):
             if len(line) > 4000:
                 continue
             for pid, rx, sev, desc in SECRET_PATTERNS:
-                m = rx.search(line)
-                if m:
+                for m in rx.finditer(line):
                     if pid == "private-key":
                         if lineno in block_headers:
                             continue  # the complete block supersedes this header-only hit
@@ -630,22 +640,23 @@ def scan_secrets(root, files, add):
                         if not re.match(r"^\s*[A-Za-z0-9+/=]{20,}\s*$", nxt):
                             continue
                     ev = redact(m.group(0))
+                    match_sev = sev
                     if pid != "private-key":
                         note = _pattern_hint(m.group(0), line[:m.start()])
                         if note:  # v0.4.1: AWS docs key / masked xoxb-xxxx… / form placeholder
-                            sev = "low"
+                            match_sev = "low"
                             ev += " (%s)" % note
-                    add("secret", sev, rel, lineno, summary=desc + " detected", evidence=ev)
+                    add("secret", match_sev, rel, lineno, summary=desc + " detected", evidence=ev)
             gm = GENERIC.search(line)
-            if gm and re.match(r"^(https?|wss?)://", gm.group(2), re.I):
+            if gm and re.match(r"^(https?|wss?)://", gm.group('value'), re.I):
                 gm = None  # `OAUTH2_TOKEN = "https://…"` is an endpoint URL, not a credential (v0.4)
             if gm:
-                sev, note = _generic_sev(gm.group(2), line[:gm.start(2)])
-                ev = redact(gm.group(2))
+                sev, note = _generic_sev(gm.group('value'), line[:gm.start('value')])
+                ev = redact(gm.group('value'))
                 if note:
                     ev += " (%s)" % note
                 add("secret", sev, rel, lineno,
-                    summary="Hardcoded %s assignment" % gm.group(1).lower(), evidence=ev)
+                    summary="Hardcoded %s assignment" % gm.group('name').lower(), evidence=ev)
 
 
 # ---------------------------------------------------------------- config
@@ -757,7 +768,7 @@ def scan_config(root, files, add):
         if (base == ".env" or base.startswith(".env.")) and not re.search(r"\.(example|sample|template|dist)$", base):
             for lineno, line in enumerate(body().splitlines(), 1):
                 s = line.strip()
-                if s and not s.startswith("#") and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", s):
+                if s and not s.startswith("#") and re.match(r"^(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\s*=", s):
                     add("config", "high", rel, lineno,
                         summary="Committed .env file with assignments",
                         evidence=redact(s.split("=", 1)[0]) + "=…")
@@ -766,7 +777,7 @@ def scan_config(root, files, add):
             _scan_dockerfile(body(), rel, add)
         if re.match(r"^docker-compose.*\.ya?ml$", base) or base == "compose.yml":
             for lineno, line in enumerate(body().splitlines(), 1):
-                if re.search(r"privileged:\s*true", line, re.I):
+                if re.fullmatch(r"\s*privileged:\s*true(?:\s+#.*)?\s*", line, re.I):
                     add("config", "medium", rel, lineno,
                         summary="docker-compose service runs privileged",
                         evidence="privileged: true")
@@ -1119,9 +1130,11 @@ def main(argv):
                                  f["category"], f["file"] or "", f["line"] or 0,
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+        by_category[f["category"]] = by_category.get(f["category"], 0) + 1
 
     commit = git_head(root)
     doc = {
@@ -1137,6 +1150,7 @@ def main(argv):
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
+            "by_category": by_category,
             "lockfiles_parsed": sorted(PARSED_LOCKFILES),
             "truncated": {"findings": findings_truncated, "files": files_truncated},
         },
