@@ -4,6 +4,7 @@
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                [--fail-on SEV] [--triage]
 
+  --json PATH     write JSON to PATH; use - for stdout (also the default).
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
@@ -48,7 +49,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.5"
+VERSION = "0.4.6"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -512,6 +513,8 @@ PLACEHOLDER_ATTR_RE = re.compile(r"placeholder\s*[:=]\s*[{'\"]", re.I)
 
 def _value_hint(value, line_prefix=""):
     """Shape hint for a generic `key = "value"` hit (None = looks like a literal credential)."""
+    if re.fullmatch(r"\.{3,}", value):
+        return "placeholder?"
     if re.search(r"example|changeme|your[_-]|xxx|dummy|placeholder|<|\$\{", value, re.I):
         return "placeholder?"
     if any(ord(c) > 127 for c in value):
@@ -577,6 +580,10 @@ SECRET_PATTERNS = [
 ]
 GENERIC = re.compile(
     r"""(?i)(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['"]([^'"\s]{16,})['"]""")
+PRIVATE_KEY_BLOCK = re.compile(
+    r"^[ \t]*-----BEGIN (?P<label>[A-Z ]*PRIVATE KEY)-----[ \t]*\r?\n"
+    r"(?P<body>(?:[ \t]*[A-Za-z0-9+/=_.*-]+[ \t]*\r?\n)+)"
+    r"[ \t]*-----END (?P=label)-----[ \t]*\r?$", re.M)
 
 
 def scan_secrets(root, files, add):
@@ -590,6 +597,24 @@ def scan_secrets(root, files, add):
             continue
         rel = os.path.relpath(path, root)
         lines = text.splitlines()
+        block_headers = set()
+        for m in PRIVATE_KEY_BLOCK.finditer(text):
+            body_lines = [line.strip() for line in m.group("body").splitlines()]
+            body = "".join(body_lines)
+            note = _pattern_hint(body) or _value_hint(body)
+            # Complete blocks need at least three base64 lines. Recognizable examples
+            # may replace that body with a short mask/placeholder; keep them as low hits.
+            if not note and (len(body_lines) < 3 or any(
+                    not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", line)
+                    for line in body_lines)):
+                continue
+            lineno = text.count("\n", 0, m.start()) + 1
+            block_headers.add(lineno)
+            ev = redact(m.group(0).lstrip())
+            if note:
+                ev += " (%s)" % note
+            add("secret", "low" if note else "critical", rel, lineno,
+                summary="Multiline private key block detected", evidence=ev)
         for lineno, line in enumerate(lines, 1):
             if len(line) > 4000:
                 continue
@@ -597,6 +622,8 @@ def scan_secrets(root, files, add):
                 m = rx.search(line)
                 if m:
                     if pid == "private-key":
+                        if lineno in block_headers:
+                            continue  # the complete block supersedes this header-only hit
                         # a real PEM block is followed by a base64 body line; a header inside
                         # source code (regex/validator/test string) is not a leaked key
                         nxt = lines[lineno] if lineno < len(lines) else ""
@@ -1135,7 +1162,7 @@ def main(argv):
     if ERRORS:
         doc["errors"] = ERRORS
     text = json.dumps(doc, indent=2)
-    if out_path:
+    if out_path and out_path != "-":
         with open(out_path, "w") as fh:
             fh.write(text + "\n")
         sys.stderr.write("wrote %s (%d findings)\n" % (out_path, len(findings)))

@@ -15,6 +15,7 @@ silently undo them:
   * summary.lockfiles_parsed / summary.notes, manifest_hash determinism, --triage additivity and
     the --fail-on gate on the committed test_fixture.
 """
+import base64
 import contextlib
 import hashlib
 import io
@@ -238,6 +239,72 @@ class ScanSecretsTests(unittest.TestCase):
     def test_real_private_key_block_is_critical(self):
         f = self._one("keys/id_rsa")
         self.assertEqual((f["severity"], f["summary"]), ("critical", "Private key block detected"))
+
+    def _pem_block(self, label="RSA PRIVATE KEY", body=None, footer=None):
+        # Base64 of plain text, never key material or a functional private key.
+        if body is None:
+            encoded = base64.b64encode(b"Not a key; synthetic bytes 0123456789. " * 4).decode()
+            body = "\n".join(encoded[i:i + 64] for i in range(0, len(encoded), 64))
+        return "-----BEGIN %s-----\n%s\n-----END %s-----\n" % (
+            label, body, footer or label)
+
+    def _scan_pem(self, text):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "key.pem"), "w") as fh:
+                fh.write(text)
+            return _collect(root, scan.scan_secrets)
+
+    def test_complete_multiline_private_key_labels_and_redaction(self):
+        for label in ("PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY",
+                      "OPENSSH PRIVATE KEY", "DSA PRIVATE KEY", "PGP PRIVATE KEY",
+                      "ENCRYPTED PRIVATE KEY", "CUSTOM LABEL PRIVATE KEY"):
+            with self.subTest(label=label):
+                block = self._pem_block(label)
+                findings = self._scan_pem("configuration\n" + block)
+                self.assertEqual(len(findings), 1, findings)
+                f = findings[0]
+                self.assertEqual((f["severity"], f["line"], f["summary"]),
+                                 ("critical", 2, "Multiline private key block detected"))
+                self.assertEqual(f["evidence"], "----…")
+                self.assertFalse(scan._secret_false_positive(f)[0])
+                self.assertNotIn(block.splitlines()[1], json.dumps(findings))
+
+    def test_complete_private_key_placeholder_bodies_are_low(self):
+        for body, hint in (("...", "placeholder?"), ("YOUR_KEY_HERE", "placeholder?"),
+                           ("REDACTED", "word-like?"), ("xxxx", "placeholder?"),
+                           ("00000000", "example-key?"), ("****", "example-key?"),
+                           ("AKIAIOSFODNN7EXAMPLE", "example-key?")):
+            for count in (1, 3):
+                with self.subTest(body=body, lines=count):
+                    findings = self._scan_pem(self._pem_block(body="\n".join([body] * count)))
+                    blocks = [f for f in findings if "private key block" in f["summary"]]
+                    self.assertEqual(len(blocks), 1, findings)
+                    self.assertEqual(blocks[0]["severity"], "low")
+                    # Six or more x's use the existing fixed-pattern mask hint.
+                    expected = "example-key?" if body == "xxxx" and count == 3 else hint
+                    self.assertEqual(blocks[0]["evidence"], "----… (%s)" % expected)
+                    self.assertTrue(scan._secret_false_positive(blocks[0])[0])
+
+    def test_multiline_private_key_requires_matching_footer_and_body(self):
+        body = self._pem_block().splitlines()[1:]
+        cases = [self._pem_block(footer="EC PRIVATE KEY"),
+                 self._pem_block().rsplit("-----END", 1)[0],
+                 self._pem_block(body=body[0]),
+                 self._pem_block(body="A1B2\nC3D4\ninvalid!"),
+                 self._pem_block(body=""),
+                 "-----BEGIN RSA PRIVATE KEY-----\n"]
+        for text in cases:
+            with self.subTest(text=text):
+                findings = self._scan_pem(text)
+                self.assertFalse(any(f["summary"].startswith("Multiline") for f in findings))
+
+    def test_multiple_private_key_blocks_and_crlf(self):
+        text = self._pem_block() + "gap\n" + self._pem_block("EC PRIVATE KEY")
+        findings = self._scan_pem(text.replace("\n", "\r\n"))
+        self.assertEqual(len(findings), 2, findings)
+        self.assertEqual([f["line"] for f in findings], [1, 8])
+        self.assertTrue(all(f["summary"] == "Multiline private key block detected"
+                            for f in findings))
 
     def test_minified_js_is_skipped(self):
         self.assertNotIn("lib/vendor.min.js", self.by_file)

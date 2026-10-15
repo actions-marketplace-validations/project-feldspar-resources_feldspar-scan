@@ -26,12 +26,17 @@ python3 scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] 
 (see *Triage* under Output shape). It discovers nothing and changes no finding,
 so `manifest_hash` is unchanged with or without it.
 
+JSON is printed to stdout by default. Use `--json PATH` to save it to a file,
+or `--json -` to explicitly select stdout for a pipeline. Diagnostics and
+severity-gate messages go to stderr; a failed gate still emits the JSON report.
+To write a literal file named `-`, use `--json ./-`.
+
 **2. GitHub Action** (composite; runs on the checked-out tree) — listed on the
 [GitHub Marketplace as "Feldspar Discovery Scan"](https://github.com/marketplace/actions/feldspar-discovery-scan):
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.5
+- uses: project-feldspar-resources/feldspar-scan@v0.4.6
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -49,7 +54,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.5`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.6`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -207,11 +212,20 @@ characters plus `…`.
 | `xox[baprs]-[0-9A-Za-z-]{10,}` (Slack) | high |
 | `sk_live_[0-9a-zA-Z]{24,}` (Stripe live) | critical |
 | `AIza[0-9A-Za-z_-]{35}` (Google API key) | medium |
-| `-----BEGIN … PRIVATE KEY-----` | critical |
+| Complete multiline `BEGIN … PRIVATE KEY` / matching `END` block | critical |
+| Known private-key header followed by a base64-looking line (legacy fallback) | critical |
 | generic `key/secret/password/token = "…16+ chars"` | medium |
 | Stripe live restricted key (`rk_live_` + 24+ alphanumeric characters) | high |
 
 URL-safe characters above are `A-Z`, `a-z`, `0-9`, `_`, and `-`.
+
+Complete private-key blocks accept any uppercase/space label (including unlabelled
+`PRIVATE KEY`), require at least three base64 body lines, and produce one
+`Multiline private key block detected` finding on the header line. That finding
+replaces the legacy header hit. Body hints reuse the existing example/mask and
+value-shape checks to downgrade to **low**; a short placeholder body such as `...`,
+`YOUR_KEY_HERE`, `REDACTED`, or `xxxx` is also retained as a low finding. Evidence
+never includes the body. A bare header in source without a body remains ignored.
 
 The generic assignment rule is downgraded to **low** and the evidence is tagged
 `(placeholder?)` when the value matches
@@ -292,8 +306,10 @@ All config checks listed above are implemented.
   `--triage` (low priority), and a package listed in both a fixture and a shipped
   lockfile is attributed to the shipped one.
 * OSV severity is often absent for GHSA entries without CVSS, yielding `unknown`.
-* Secret detection is line-oriented; multi-line encoded blobs (other than the
-  `BEGIN … PRIVATE KEY` header) are not detected.
+* Secret detection is line-oriented except for complete multiline private-key
+  blocks with matching labels. PEM metadata lines, escaped newlines and other
+  multiline encoded blobs are not parsed. Block bodies are checked for base64
+  shape, not decoded or cryptographically validated; synthetic examples can match.
 
 ## Dockerfile checks
 
