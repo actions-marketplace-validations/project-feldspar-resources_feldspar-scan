@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.11"
+VERSION = "0.4.12"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -536,7 +536,9 @@ EXAMPLE_KEYS = {
     "ghp_16C7e42F292c6912E7710c838347Ae178B4a",               # GitHub docs example token
 }
 MASKED_RE = re.compile(r"x{6,}|X{6,}|0{8,}|\*{4,}|EXAMPLE")
-PLACEHOLDER_ATTR_RE = re.compile(r"(?<![\w-])placeholder\s*[:=]\s*[{'\"]", re.I)
+# Match only an open value in the prefix before a hit, not a closed earlier field.
+PLACEHOLDER_ATTR_RE = re.compile(
+    r"""(?<![\w-])placeholder\s*[:=]\s*(?:"[^"]*|'[^']*|\{[^}]*)$""", re.I)
 
 
 def _value_hint(value, line_prefix=""):
@@ -577,11 +579,11 @@ def _generic_sev(match_value, line_prefix=""):
 
 
 SECRET_PATTERNS = [
-    ("aws-access-key-id", re.compile(r"(?<![A-Za-z0-9_])AKIA[0-9A-Z]{16}(?![A-Za-z0-9_])"),
+    ("aws-access-key-id", re.compile(r"(?<!\w)AKIA[0-9A-Z]{16}(?!\w)"),
      "high", "AWS access key ID"),
-    ("github-token", re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9]{36,}(?![A-Za-z0-9_])"),
+    ("github-token", re.compile(r"(?<!\w)gh[pousr]_[A-Za-z0-9]{36,}(?!\w)"),
      "high", "GitHub token"),
-    ("github-pat", re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{80,}(?![A-Za-z0-9_])"),
+    ("github-pat", re.compile(r"(?<!\w)github_pat_[A-Za-z0-9_]{80,}(?!\w)"),
      "high", "GitHub fine-grained PAT"),
     ("gitlab-pat", re.compile(r"(?<![\w-])glpat-[A-Za-z0-9_-]{20}(?![\w-])"),
      "high", "GitLab personal access token"),
@@ -589,7 +591,7 @@ SECRET_PATTERNS = [
      "high", "npm access token"),
     ("openai-api-key", re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-[A-Za-z0-9_-]{40,}|(?!proj-|ant-)[A-Za-z0-9_-]{40,})(?![A-Za-z0-9_-])"),
      "high", "OpenAI API key"),
-    ("anthropic-api-key", re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])"),
+    ("anthropic-api-key", re.compile(r"(?<![\w-])sk-ant-[A-Za-z0-9_-]{40,}(?![\w-])"),
      "high", "Anthropic API key"),
     ("huggingface-token", re.compile(r"(?<!\w)hf_[A-Za-z0-9]{34,}(?!\w)"),
      "medium", "Hugging Face token"),
@@ -597,15 +599,15 @@ SECRET_PATTERNS = [
      "high", "SendGrid API key"),
     ("telegram-bot-token", re.compile(r"(?<![A-Za-z0-9_-])[0-9]+:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
      "high", "Telegram bot token"),
-    ("twilio-api-key-sid", re.compile(r"(?<![A-Za-z0-9_])SK[0-9a-fA-F]{32}(?![A-Za-z0-9_])"),
+    ("twilio-api-key-sid", re.compile(r"(?<!\w)SK[0-9a-fA-F]{32}(?!\w)"),
      "medium", "Twilio API key SID"),
     ("slack-token", re.compile(r"(?<![0-9A-Za-z_-])xox[baprs]-[0-9A-Za-z-]{10,}(?![0-9A-Za-z_-])"),
      "high", "Slack token"),
-    ("stripe-live-key", re.compile(r"(?<![A-Za-z0-9_])sk_live_[0-9a-zA-Z]{24,}(?![A-Za-z0-9_])"),
+    ("stripe-live-key", re.compile(r"(?<!\w)sk_live_[0-9a-zA-Z]{24,}(?!\w)"),
      "critical", "Stripe live secret key"),
-    ("stripe-restricted-key", re.compile(r"(?<![A-Za-z0-9_])rk_live_[0-9a-zA-Z]{24,}(?![A-Za-z0-9_])"),
+    ("stripe-restricted-key", re.compile(r"(?<!\w)rk_live_[0-9a-zA-Z]{24,}(?!\w)"),
      "high", "Stripe live restricted key"),
-    ("google-api-key", re.compile(r"(?<![0-9A-Za-z_-])AIza[0-9A-Za-z_-]{35}(?![0-9A-Za-z_-])"),
+    ("google-api-key", re.compile(r"(?<![\w-])AIza[0-9A-Za-z_-]{35}(?![\w-])"),
      "medium", "Google API key"),
     ("private-key", re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
      "critical", "Private key block"),
@@ -1178,10 +1180,13 @@ def main(argv):
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
+    highest_severity_by_file = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
+        # Findings are already sorted from highest to lowest severity.
+        highest_severity_by_file.setdefault(f["file"], f["severity"])
         counts = by_category_severity.setdefault(f["category"], dict.fromkeys(by_sev, 0))
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
 
@@ -1192,6 +1197,10 @@ def main(argv):
     vulnerable_packages_by_ecosystem = {}
     for ecosystem, _, _ in sorted(vulnerable):
         vulnerable_packages_by_ecosystem[ecosystem] = vulnerable_packages_by_ecosystem.get(ecosystem, 0) + 1
+
+    packages_by_manifest = dict.fromkeys(sorted(PARSED_LOCKFILES), 0)
+    for manifest in pkgs.values():
+        packages_by_manifest[manifest] += 1
 
     commit = git_head(root)
     doc = {
@@ -1208,6 +1217,7 @@ def main(argv):
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
             "packages_by_ecosystem": packages_by_ecosystem,
+            "packages_by_manifest": packages_by_manifest,
             "vulnerable_packages": len(vulnerable),
             "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
             "unique_advisories": len({vid for f in findings
@@ -1219,9 +1229,12 @@ def main(argv):
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
             "highest_severity": findings[0]["severity"] if findings else None,
+            "highest_severity_by_file": dict(sorted(highest_severity_by_file.items())),
             "by_category": by_category,
             "by_category_severity": by_category_severity,
             "lockfiles_parsed": sorted(PARSED_LOCKFILES),
+            "limits": {"files": MAX_FILES, "findings": MAX_FINDINGS,
+                       "findings_per_file": MAX_FINDINGS_PER_FILE},
             "truncated": {"findings": findings_truncated, "files": files_truncated},
         },
         "findings": findings,

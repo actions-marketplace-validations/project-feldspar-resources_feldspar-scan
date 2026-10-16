@@ -43,7 +43,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.11
+- uses: project-feldspar-resources/feldspar-scan@v0.4.12
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.11`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.12`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -159,6 +159,15 @@ Multiple advisories for one package version count once; distinct versions count
 separately. No returned vulnerabilities or `--no-osv` produces `{}`. These counts
 do not establish lookup completeness or change findings, gates, or `manifest_hash`.
 
+`summary.packages_by_manifest` counts deduplicated inventory entries attributed to
+each parsed manifest, in sorted path order, including zero counts. Each unique
+`(ecosystem, name, version)` is attributed to one file: the first encountered,
+with a shipped manifest preferred over a test/fixture/example manifest. These
+counts sum to `summary.packages_found`; they are not raw per-file dependency
+counts. An empty object means no manifest was parsed. These inventory counts
+are available with `--no-osv`, are bounded by file limits, and are unaffected by
+finding limits or advisory results. They do not change `manifest_hash`.
+
 `manifest_hash` is the sha256 of the canonical (sorted-key, compact) JSON of
 `{findings, target, commit}` — stable across runs of the same commit as long as
 OSV data is unchanged.
@@ -226,6 +235,20 @@ the number of emitted raw findings at or above it (`matching_findings`), and
 and does not affect `manifest_hash`. Passing describes the exit-code gate,
 not complete coverage: review errors, notes and truncation flags, since discarded
 findings cannot contribute to the count.
+
+`summary.limits` records the applied caps: `files` (candidate files visited),
+`findings` (total findings emitted), and `findings_per_file` (findings emitted
+per file across all categories). These are limits, not observed counts; consult
+`summary.truncated` to see whether file or finding results were omitted at those
+caps. A false truncation flag does not certify complete coverage: other filters
+and limits still apply. This metadata does not affect `manifest_hash`.
+
+`summary.highest_severity_by_file` maps each affected relative file path to its
+highest emitted finding severity, with paths sorted lexically. `unknown` ranks
+below `low`; files without findings are omitted, and an empty scan returns `{}`.
+This summarizes emitted findings only, so finding caps can hide higher-severity
+results. Check `summary.truncated` for incomplete results. Like the overall
+highest severity, this field does not affect `manifest_hash`.
 
 ### Triage (`--triage`)
 
@@ -347,6 +370,14 @@ value-shape checks to downgrade to **low**; a short placeholder body such as `..
 `YOUR_KEY_HERE`, `REDACTED`, or `xxxx` is also retained as a low finding. Evidence
 never includes the body. A bare header in source without a body remains ignored.
 
+The legacy header fallback also emits a **critical** `Private key block detected`
+finding for an unlabelled, RSA, EC, OPENSSH, DSA or PGP private-key header when
+the next line contains at least 20 characters from `A-Z`, `a-z`, `0-9`, `+`, `/`
+or `=` (with optional surrounding whitespace). This fallback does not require a
+footer or a complete key, and does not apply body placeholder downgrades. Its
+evidence contains only the redacted header. These are text-shape checks, not
+proof that the body is valid base64 or usable private-key material.
+
 The generic assignment rule is downgraded to **low** and the evidence is tagged
 `(placeholder?)` when the value matches
 `example|changeme|your[_-]|xxx|dummy|placeholder|<|${`.
@@ -436,16 +467,25 @@ All config checks listed above are implemented.
   `govulncheck` for that.
 * Yarn v1 and Yarn Berry (v2+) lockfiles are parsed (Berry since v0.4; workspace/
   patch/portal entries are skipped). `composer.lock`, Maven/Gradle and NuGet are not.
-* `summary.lockfiles_parsed` lists what was actually read; when nothing was,
-  `summary.notes` says so — a zero is not "clean". Dependency hits whose lockfile
+* `summary.lockfiles_parsed` lists supported, readable manifests whose parser
+  returned normally, even if it returned no packages. Empty files, unpinned
+  requirements and some malformed inputs (such as invalid package-lock JSON)
+  can appear here without an `errors` entry. A nonempty list does not establish
+  syntax validity, package discovery or advisory lookup success. Unsupported
+  files and manifests over the 8 MiB read limit are omitted. The "No supported
+  dependency manifest was parsed" note appears only when this list is empty;
+  check `summary.packages_found`, `summary.osv_enabled` and `errors` as well.
+  Dependency hits whose lockfile
   sits under a test/fixture/example/benchmark path are tagged `scaffold` by
   `--triage` (low priority), and a package listed in both a fixture and a shipped
   lockfile is attributed to the shipped one.
 * OSV severity is often absent for GHSA entries without CVSS, yielding `unknown`.
 * Secret detection is line-oriented except for complete multiline private-key
-  blocks with matching labels. PEM metadata lines, escaped newlines and other
-  multiline encoded blobs are not parsed. Block bodies are checked for base64
-  shape, not decoded or cryptographically validated; synthetic examples can match.
+  blocks with matching labels and the header/next-line fallback described above.
+  An incomplete block can still produce a critical fallback finding. PEM metadata
+  lines, escaped newlines and other multiline encoded blobs are not parsed. Block
+  bodies are checked for base64 shape, not decoded or cryptographically validated;
+  synthetic examples can match.
 
 ## Dockerfile checks
 
