@@ -43,7 +43,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.10
+- uses: project-feldspar-resources/feldspar-scan@v0.4.11
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.10`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.11`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -124,6 +124,20 @@ committed `.env`. All three detectors should fire.
 Top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
 
+`summary.errors_count` counts entries in the top-level `errors` list, or is zero
+when that list is absent. It counts recorded errors, not affected packages or
+failed requests. Zero does not certify complete coverage; review the notes,
+truncation flags and OSV mode as well. Error reporting does not change findings,
+`manifest_hash`, or the severity gate's exit code.
+
+`summary.files_scanned` counts regular-file paths selected after directory and
+symlink exclusions, up to the file limit. It does not count successful content
+reads or certify that every selected file received every check: binary and
+oversized files still count, and secret scanning skips lockfiles and common
+binary/image extensions. Excluded directories and symlinks do not count. When
+`summary.truncated.files` is true, additional candidate files were omitted.
+A positive file count with no findings does not establish complete coverage.
+
 `summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
 lookups, and `true` otherwise. It records the selected mode, not lookup success:
 check `errors`, `summary.packages_found`, and `summary.lockfiles_parsed` for
@@ -136,6 +150,14 @@ entries for each observed ecosystem, in sorted ecosystem order. Its counts sum t
 different versions count separately. Empty inventory produces `{}`. These are
 inventory counts, including with `--no-osv`, not advisory counts or proof of a
 complete assessment. File limits bound this inventory; finding limits do not.
+
+`summary.vulnerable_packages_by_ecosystem` counts unique vulnerable
+`(ecosystem, name, version)` entries returned by OSV, grouped in sorted ecosystem
+order. Only affected ecosystems appear, and the counts sum to
+`summary.vulnerable_packages`, even when finding limits truncate the report.
+Multiple advisories for one package version count once; distinct versions count
+separately. No returned vulnerabilities or `--no-osv` produces `{}`. These counts
+do not establish lookup completeness or change findings, gates, or `manifest_hash`.
 
 `manifest_hash` is the sha256 of the canonical (sorted-key, compact) JSON of
 `{findings, target, commit}` — stable across runs of the same commit as long as
@@ -171,6 +193,14 @@ when scan limits truncate the report. A dependency finding may represent several
 advisories; the count is not the number of advisories. Zero dependency findings
 does not certify coverage (see `summary.osv_enabled` above). These counts do not
 affect `manifest_hash`.
+
+`summary.by_category_severity` breaks each category count down into `critical`,
+`high`, `medium`, `low`, and `unknown`, including zeros. For example,
+`summary.by_category_severity.secret.high` counts emitted high-severity secret
+findings. Each row sums to its `summary.by_category` count, and each severity
+column sums to its `summary.by_severity` count. These are raw severities, unchanged
+by `--triage`, and count only emitted findings when limits truncate the report.
+This summary does not affect `manifest_hash` or the `--fail-on` exit gate.
 
 `summary.highest_severity` is the highest severity in the emitted findings,
 ordered `critical`, `high`, `medium`, `low`, then `unknown`. It is `unknown` when
@@ -271,6 +301,14 @@ The generic-assignment check skips values starting with `http://`, `https://`,
 secrets inside URLs: provider-token patterns still report with redacted evidence.
 Other schemes and malformed URL prefixes do not get this exclusion.
 
+Single-line provider patterns and generic assignments are checked only on lines
+of at most 4,000 characters (excluding the line ending; Unicode characters count
+as one character each). Longer lines are skipped, but later lines in the same
+file are still checked. The separate multiline private-key block check is not
+subject to this per-line limit; the file-size and file-selection limits above
+still apply. A report with no secret findings does not establish that skipped
+lines are free of secrets.
+
 | Pattern | Severity |
 | --- | --- |
 | `AKIA[0-9A-Z]{16}` (AWS access key id) | high |
@@ -289,9 +327,12 @@ Other schemes and malformed URL prefixes do not get this exclusion.
 | `AIza[0-9A-Za-z_-]{35}` (Google API key) | medium |
 | Complete multiline `BEGIN … PRIVATE KEY` / matching `END` block | critical |
 | Known private-key header followed by a base64-looking line (legacy fallback) | critical |
-| generic `key/secret/password/token = "…16+ chars"` | medium |
+| generic `api_key` / `api-key` / `apikey` / `secret` / `password` / `passwd` / `token` assignment | medium |
 | Stripe live restricted key (`rk_live_` + 24+ alphanumeric characters) | high |
 
+Generic assignment names above are case-insensitive; bare `key` is not recognized
+by this rule. Assignments use `=` or `:` followed by a single- or double-quoted
+value of at least 16 characters with no whitespace or embedded quotes.
 Generic assignment keys may also be enclosed in paired single or double quotes,
 such as JSON's `"password": "…16+ chars"`. This is a line-based heuristic, not a
 JSON/YAML parser; the existing value exclusions and hint downgrades still apply.
@@ -337,7 +378,9 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
 * `Dockerfile` with `ADD http(s)://…` — low.
 * `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` containing a plain
-  `privileged: true` declaration — medium. This line-based heuristic allows trailing
+  `privileged: true` declaration — medium. The key may be unquoted or enclosed in
+  matching single or double quotes; the value must remain plain `true`.
+  This line-based heuristic allows trailing
   comments, but ignores commented declarations, unrelated keys and longer scalar
   values such as `trueish`; it does not parse general YAML structure.
 * `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs

@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.10"
+VERSION = "0.4.11"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -536,7 +536,7 @@ EXAMPLE_KEYS = {
     "ghp_16C7e42F292c6912E7710c838347Ae178B4a",               # GitHub docs example token
 }
 MASKED_RE = re.compile(r"x{6,}|X{6,}|0{8,}|\*{4,}|EXAMPLE")
-PLACEHOLDER_ATTR_RE = re.compile(r"placeholder\s*[:=]\s*[{'\"]", re.I)
+PLACEHOLDER_ATTR_RE = re.compile(r"(?<![\w-])placeholder\s*[:=]\s*[{'\"]", re.I)
 
 
 def _value_hint(value, line_prefix=""):
@@ -585,15 +585,15 @@ SECRET_PATTERNS = [
      "high", "GitHub fine-grained PAT"),
     ("gitlab-pat", re.compile(r"(?<![\w-])glpat-[A-Za-z0-9_-]{20}(?![\w-])"),
      "high", "GitLab personal access token"),
-    ("npm-token", re.compile(r"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"),
+    ("npm-token", re.compile(r"(?<!\w)npm_[A-Za-z0-9]{36}(?!\w)"),
      "high", "npm access token"),
     ("openai-api-key", re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-[A-Za-z0-9_-]{40,}|(?!proj-|ant-)[A-Za-z0-9_-]{40,})(?![A-Za-z0-9_-])"),
      "high", "OpenAI API key"),
     ("anthropic-api-key", re.compile(r"(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])"),
      "high", "Anthropic API key"),
-    ("huggingface-token", re.compile(r"(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{34,}(?![A-Za-z0-9_])"),
+    ("huggingface-token", re.compile(r"(?<!\w)hf_[A-Za-z0-9]{34,}(?!\w)"),
      "medium", "Hugging Face token"),
-    ("sendgrid-api-key", re.compile(r"(?<![A-Za-z0-9_-])SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
+    ("sendgrid-api-key", re.compile(r"(?<![\w-])SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![\w-])"),
      "high", "SendGrid API key"),
     ("telegram-bot-token", re.compile(r"(?<![A-Za-z0-9_-])[0-9]+:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
      "high", "Telegram bot token"),
@@ -799,7 +799,7 @@ def scan_config(root, files, add):
             _scan_dockerfile(body(), rel, add)
         if re.match(r"^docker-compose.*\.ya?ml$", base) or base in ("compose.yml", "compose.yaml"):
             for lineno, line in enumerate(body().splitlines(), 1):
-                if re.fullmatch(r"\s*privileged:\s*true(?:\s+#.*)?\s*", line, re.I):
+                if re.fullmatch(r'''\s*(["']?)privileged\1:\s*true(?:\s+#.*)?\s*''', line, re.I):
                     add("config", "medium", rel, lineno,
                         summary="docker-compose service runs privileged",
                         evidence="privileged: true")
@@ -1177,14 +1177,21 @@ def main(argv):
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
+    by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
+        counts = by_category_severity.setdefault(f["category"], dict.fromkeys(by_sev, 0))
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
 
     packages_by_ecosystem = {}
     for ecosystem, _, _ in sorted(pkgs):
         packages_by_ecosystem[ecosystem] = packages_by_ecosystem.get(ecosystem, 0) + 1
+
+    vulnerable_packages_by_ecosystem = {}
+    for ecosystem, _, _ in sorted(vulnerable):
+        vulnerable_packages_by_ecosystem[ecosystem] = vulnerable_packages_by_ecosystem.get(ecosystem, 0) + 1
 
     commit = git_head(root)
     doc = {
@@ -1202,15 +1209,18 @@ def main(argv):
             "packages_found": len(pkgs),
             "packages_by_ecosystem": packages_by_ecosystem,
             "vulnerable_packages": len(vulnerable),
+            "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"
                                       for vid in f["vuln_ids"]}),
             "osv_enabled": use_osv,
+            "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
             "highest_severity": findings[0]["severity"] if findings else None,
             "by_category": by_category,
+            "by_category_severity": by_category_severity,
             "lockfiles_parsed": sorted(PARSED_LOCKFILES),
             "truncated": {"findings": findings_truncated, "files": files_truncated},
         },
