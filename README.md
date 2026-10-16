@@ -31,12 +31,19 @@ or `--json -` to explicitly select stdout for a pipeline. Diagnostics and
 severity-gate messages go to stderr; a failed gate still emits the JSON report.
 To write a literal file named `-`, use `--json ./-`.
 
+Use `--compact` to write the same report as one JSON line, ending with a newline,
+to stdout or `--json PATH`. The default remains indented JSON. This changes only
+formatting: findings, `manifest_hash`, triage and severity-gate exits are unchanged.
+
+Run `python3 scan.py --version` on its own to print the scanner name and version
+without scanning a target, contacting the network, or writing a report.
+
 **2. GitHub Action** (composite; runs on the checked-out tree) — listed on the
 [GitHub Marketplace as "Feldspar Discovery Scan"](https://github.com/marketplace/actions/feldspar-discovery-scan):
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.8
+- uses: project-feldspar-resources/feldspar-scan@v0.4.9
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -54,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.8`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.9`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -144,6 +151,13 @@ after sorting (`F-001`…).
 file count once. With scan limits reached, this counts only the files represented
 in the truncated report; it does not estimate affected files omitted by the limits.
 
+`summary.files_with_findings_by_category` counts distinct relative file paths for
+each of `dependency-vuln`, `secret`, and `config`, including zero counts. Repeated
+findings in one file count once within each category; a file with both secret and
+config findings counts in both categories. These counts can therefore sum to more
+than `files_with_findings`. They count only emitted findings when scan limits
+truncate results and do not affect `manifest_hash`.
+
 `summary.by_category` counts emitted findings for `dependency-vuln`, `secret`, and
 `config`, including zero counts. Its values sum to the length of `findings`, even
 when scan limits truncate the report. A dependency finding may represent several
@@ -159,6 +173,15 @@ Scan limits can omit more severe findings, and an empty report does not certify
 coverage. Check `summary.truncated`, `summary.osv_enabled`, notes and errors.
 This summary field does not affect `manifest_hash`.
 
+`summary.unique_advisories` counts distinct advisory ID strings in emitted
+`dependency-vuln` findings. A shared ID counts once across packages and versions;
+different IDs count separately even if they are aliases for the same issue.
+This differs from `summary.vulnerable_packages`, which counts affected inventory
+entries before finding limits. File and finding limits bound the advisory count.
+Zero means no advisory IDs were emitted, including with `--no-osv`; it does not
+certify coverage or successful lookups. Check errors, notes and truncation flags.
+This summary field does not affect `manifest_hash`.
+
 ### Triage (`--triage`)
 
 With `--triage` the output gains two additive top-level keys and the raw findings
@@ -167,6 +190,9 @@ and `manifest_hash` stay untouched:
 - `triage_summary` — counts and a one-line `headline`: dependency advisories split
   into `upgradeable` (a patched release exists) vs `monitor_only` (no patch yet),
   and secret hits split into `needs_review` vs `likely_false_positive`.
+  `config.needs_review` counts configuration findings and includes them in the
+  headline, including when no secrets or dependency findings exist. Like other
+  triage counts, it covers only emitted findings when scan limits truncate results.
 - `triage` — a map from finding `id` to an interpretation: for a `dependency-vuln`,
   `action` is `upgrade` (with `upgrade_to`) or `monitor`; for a `secret`,
   `likely_false_positive` is set true when the hit sits in a test/fixture/example/CI
@@ -178,6 +204,13 @@ and `manifest_hash` stay untouched:
 This is purely deterministic prioritisation (fix-status + path-based false-positive
 classification). It never clears a secret found in real source — it flags it for a
 human. It exists so a reader does not have to hand-triage a long raw list.
+
+`triage_summary.by_action` counts findings assigned to `upgrade`, `monitor`,
+`review`, and `informational`, including zero-valued buckets. Counts sum to the
+number of emitted findings, not files or advisory IDs. `review` includes config
+findings; scaffold dependency findings retain their upgrade/monitor action.
+When scan limits truncate the report, these counts cover only emitted findings.
+This field is present only with `--triage` and does not change the severity gate.
 
 ## What it checks
 
@@ -217,6 +250,11 @@ Regex scan of text files ≤ 1 MiB. Binary files (null byte), `.git/`,
 `node_modules/`, `vendor/`, `dist/`, `build/`, lockfiles, `*.min.js`, and common
 binary/image extensions are skipped. Evidence is always redacted to the first 4
 characters plus `…`.
+
+The generic-assignment check skips values starting with `http://`, `https://`,
+`ws://` or `wss://` (case-insensitive). This excludes endpoint strings, not all
+secrets inside URLs: provider-token patterns still report with redacted evidence.
+Other schemes and malformed URL prefixes do not get this exclusion.
 
 | Pattern | Severity |
 | --- | --- |
@@ -297,6 +335,13 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
   uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
   `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
 * `.npmrc` / `.pypirc` containing `_authToken=` or a `password` line — high.
+  Empty or whitespace-only `password=` / `password:` fields are ignored;
+  later credential lines are still checked. Quoted values and inline comments
+  after the delimiter remain nonempty for this conservative heuristic.
+  In `.npmrc`, an unscoped or registry-scoped `_authToken` value consisting only
+  of `${NAME}` (a variable name using letters, digits and underscores, starting
+  with a letter or underscore) is excluded. Mixed literal/reference values are
+  still flagged; environment variables are never read or expanded.
   This configuration check skips full-line `#` and `;` comments (including
   indented comments). Secret-pattern scanning still checks commented text.
 
@@ -388,7 +433,7 @@ Sample reports on real open-source projects are in the
 
 This scanner, the hosted scan at `/scan/`, its API, the MCP endpoint and this
 GitHub Action are free tools provided under section 2.5 of the L3Digital Standard
-Commercial Terms v1.0: <https://project-feldspar.com/terms/v1.0#s2-5> (as is, no
+Commercial Terms v1.1: <https://project-feldspar.com/terms/v1.1#s2-5> (as is, no
 warranty or support commitment; use them only on code you may lawfully scan).
 The code itself stays MIT-licensed (below). Privacy notice for the hosted
 service: <https://project-feldspar.com/privacy>.

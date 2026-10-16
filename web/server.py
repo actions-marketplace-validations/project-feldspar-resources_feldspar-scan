@@ -117,11 +117,11 @@ INDEX_DESCRIPTION = ("Free, deterministic security scan of a public GitHub, GitL
                      "triaged into fix-by-upgrade versus monitor, leaked-secret patterns with "
                      "likely false positives flagged, and config checks. No LLM, no sign-up.")
 INDEX_CANONICAL = "https://project-feldspar.com/scan/"
-# PRO-93 (2026-10-13): the free tools are provided under §2.5 of the L3Digital Standard Commercial Terms v1.0 (legal/README.md
+# PRO-93 (2026-10-13): the free tools are provided under §2.5 of the L3Digital Standard Commercial Terms v1.1 (legal/README.md
 # "Free tools": the scan page, the API and MCP responses each link the Terms so §2.5 has a point of notice).
-TERMS_URL = "https://project-feldspar.com/terms/v1.0"
+TERMS_URL = "https://project-feldspar.com/terms/v1.1"
 TERMS_FREE = TERMS_URL + "#s2-5"
-TERMS_LINE = "Free tools are provided under section 2.5 of the L3Digital Standard Commercial Terms v1.0: " + TERMS_FREE
+TERMS_LINE = "Free tools are provided under section 2.5 of the L3Digital Standard Commercial Terms v1.1: " + TERMS_FREE
 
 
 def page(title, body, index=False, wide=False):
@@ -131,7 +131,7 @@ def page(title, body, index=False, wide=False):
     """
     tail = (f"<p class=\"muted small\">{E(DISCLOSURE)}</p>"
             "<p class=\"muted small\"><a href=\"/scan/\">New scan</a> &middot; <a href=\"https://project-feldspar.com/privacy\">Privacy</a> &middot; "
-            f"<a href=\"{TERMS_FREE}\">Terms</a> (free tools: section 2.5 of the L3Digital Standard Commercial Terms v1.0)</p>")
+            f"<a href=\"{TERMS_FREE}\">Terms</a> (free tools: section 2.5 of the L3Digital Standard Commercial Terms v1.1)</p>")
     content = f"<div class=\"content prose{' results' if wide else ''}\">{body}{tail}</div>"
     if site_shell is not None:
         return site_shell.page(title, content, description=INDEX_DESCRIPTION if index else None,
@@ -430,7 +430,7 @@ def cancel_ack_text(rec, when):
     body = ("L3Digital LLC d/b/a Project Feldspar received your cancellation of order %s on %s.\n\n"
             "Received from: %s <%s>\nOrder: %s\nYour message: %s\n\n"
             "This email is the acknowledgement of receipt of your cancellation (Schedule B of the L3Digital Standard Commercial "
-            "Terms v1.0, https://project-feldspar.com/terms/v1.0#schedule-b). Please keep it.\n\n"
+            "Terms v1.1, https://project-feldspar.com/terms/v1.1#schedule-b). Please keep it.\n\n"
             "What happens next: if work had not started, the full price is refunded; if you asked for an immediate start at "
             "checkout and the work was under way, the refund is the price less a proportionate amount for the work done before "
             "you cancelled; once the work is fully performed the right to cancel has ended. The refund goes to the payment method "
@@ -660,7 +660,7 @@ AUDIT_PRICING_TEXT = (
     "refunded in full). The buyer receives an order confirmation with the Terms by email.\n"
     "- Seller: L3Digital LLC, d/b/a Project Feldspar, 1143 E. Ireland Rd. #1173, South Bend, "
     "IN 46614, United States; performed by Feldspar, an autonomous AI agent; no person reviews "
-    "the report. Terms: L3Digital Standard Commercial Terms v1.0, " + TERMS_URL + " (current "
+    "the report. Terms: L3Digital Standard Commercial Terms v1.1, " + TERMS_URL + " (current "
     "version always at https://project-feldspar.com/terms-of-service; consumer cancellation "
     "information: " + TERMS_URL + "#schedule-b). Privacy notice: https://project-feldspar.com/privacy\n"
     "- Product page and sample reports: https://project-feldspar.com/ and "

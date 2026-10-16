@@ -2,9 +2,13 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage]
+               [--fail-on SEV] [--triage] [--compact]
+       scan.py --version
+
+  --version       print scanner name and version, then exit (standalone invocation).
 
   --json PATH     write JSON to PATH; use - for stdout (also the default).
+  --compact       write JSON on one line, to stdout or --json PATH.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
@@ -21,8 +25,9 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
 
 v0.4 (2026-10-08, from the 25-repo dataset in datasets/): go.mod is the Go build list and is
 preferred over go.sum (which lists superseded versions too); Yarn Berry lockfiles are parsed;
-`summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed; URL values
-are never reported as hardcoded secrets.
+`summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed.
+Generic assignments whose values start with http://, https://, ws:// or wss://
+(case-insensitive) are skipped; provider-token patterns inside URLs still report.
 v0.4.1 (2026-10-08): second secret heuristic beyond paths — value-shape hints (template/env
 references, localized text, dotted identifier names, digit-less word-like values, form
 placeholders, documented example keys and masked values) tag the evidence `(hint?)`, drop the raw
@@ -52,7 +57,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.8"
+VERSION = "0.4.9"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -191,6 +196,8 @@ def parse_toml_packages(text, ecosystem):
 def parse_package_lock(text):
     out = []
     try:
+        if text.startswith("\ufeff"):
+            text = text[1:]  # Some producers emit a UTF-8 BOM; json.loads(str) rejects it.
         data = json.loads(text)
     except (ValueError, RecursionError):
         # JSON syntax errors, integer conversion limits and excessive nesting.
@@ -326,7 +333,7 @@ def parse_go_mod(text):
         s = line.split("//", 1)[0].strip()
         if not s:
             continue
-        if s.startswith("require ("):
+        if re.fullmatch(r"require\s+\(", s):
             in_req = True
             continue
         if in_req and s == ")":
@@ -575,7 +582,7 @@ SECRET_PATTERNS = [
      "medium", "Hugging Face token"),
     ("sendgrid-api-key", re.compile(r"(?<![A-Za-z0-9_-])SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])"),
      "high", "SendGrid API key"),
-    ("telegram-bot-token", re.compile(r"(?<![A-Za-z0-9_])[0-9]+:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+    ("telegram-bot-token", re.compile(r"(?<![A-Za-z0-9_-])[0-9]+:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
      "high", "Telegram bot token"),
     ("twilio-api-key-sid", re.compile(r"(?<![A-Za-z0-9_])SK[0-9a-fA-F]{32}(?![A-Za-z0-9_])"),
      "medium", "Twilio API key SID"),
@@ -789,6 +796,11 @@ def scan_config(root, files, add):
             for lineno, line in enumerate(body().splitlines(), 1):
                 if line.lstrip().startswith(("#", ";")):
                     continue
+                if base == ".npmrc" and re.fullmatch(
+                        r"\s*(?://[^\s=]+:)?_authToken=\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}\s*", line):
+                    continue  # A standalone environment reference contains no literal credential.
+                if re.fullmatch(r"\s*password\s*[:=]\s*", line, re.I):
+                    continue  # An empty password field contains no credential.
                 if "_authToken=" in line or re.match(r"^\s*password\s*[:=]", line, re.I):
                     add("config", "high", rel, lineno,
                         summary="Credential committed in %s" % base,
@@ -946,7 +958,7 @@ def _secret_false_positive(f):
     return False, None
 
 
-def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0):
+def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0, config_review=0):
     parts = []
     if up:
         parts.append("%d dependency advisory/ies fixable by upgrade" % up)
@@ -958,14 +970,18 @@ def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0):
         parts.append("%d secret hit(s) needing review" % sec_review)
     if sec_fp:
         parts.append("%d secret hit(s) classified likely-false-positive" % sec_fp)
+    if config_review:
+        parts.append("%d configuration finding(s) needing review" % config_review)
     return "; ".join(parts) if parts else "no actionable findings after triage"
 
 
 def triage_findings(findings):
     """Deterministic interpretation of the raw findings. Returns (per_id, summary)."""
     per_id = {}
+    by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     dep_upgrade = dep_monitor = dep_scaffold = 0
     sec_total = sec_fp = 0
+    config_review = 0
     for f in findings:
         cat = f["category"]
         t = {}
@@ -1009,13 +1025,19 @@ def triage_findings(findings):
                               "if real, rotate it and purge it from history.")}
         else:  # config / other
             t = {"action": "review"}
+            if cat == "config":
+                config_review += 1
         per_id[f["id"]] = t
+        by_action[t["action"]] += 1
     summary = {
+        "by_action": by_action,
         "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
                        "in_scaffold_lockfiles": dep_scaffold},
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
-        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp, dep_scaffold),
+        "config": {"needs_review": config_review},
+        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
+                                     dep_scaffold, config_review),
     }
     return per_id, summary
 
@@ -1034,11 +1056,15 @@ def main(argv):
     ERRORS.clear()
     PARSED_LOCKFILES.clear()
     args = argv[1:]
+    if args == ["--version"]:
+        print(SCANNER + " " + VERSION)
+        return 0
     if not args or args[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
+    compact = False
     i = 1
     while i < len(args):
         if args[i] == "--json" and i + 1 < len(args):
@@ -1049,6 +1075,9 @@ def main(argv):
             i += 1
         elif args[i] == "--triage":
             triage = True
+            i += 1
+        elif args[i] == "--compact":
+            compact = True
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
@@ -1148,10 +1177,17 @@ def main(argv):
         "summary": {
             "files_scanned": len(files),
             "files_with_findings": len({f["file"] for f in findings}),
+            "files_with_findings_by_category": {
+                category: len({f["file"] for f in findings if f["category"] == category})
+                for category in by_category
+            },
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
             "packages_by_ecosystem": packages_by_ecosystem,
             "vulnerable_packages": len(vulnerable),
+            "unique_advisories": len({vid for f in findings
+                                      if f["category"] == "dependency-vuln"
+                                      for vid in f["vuln_ids"]}),
             "osv_enabled": use_osv,
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
@@ -1182,7 +1218,7 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    text = json.dumps(doc, indent=2)
+    text = json.dumps(doc, separators=(",", ":")) if compact else json.dumps(doc, indent=2)
     if out_path and out_path != "-":
         with open(out_path, "w") as fh:
             fh.write(text + "\n")

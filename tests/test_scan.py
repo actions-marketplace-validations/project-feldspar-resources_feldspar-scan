@@ -525,6 +525,26 @@ class LockfileTests(unittest.TestCase):
                 "example.com/bad-hash v4.0.0 invalid\n")
         self.assertEqual(scan.parse_go_sum(text), [("Go", "example.com/good", "v1.2.3")])
 
+    def test_go_mod_skips_extra_fields_inside_require_block(self):
+        text = ("require (\n"
+                "  example.com/bad v1.2.3 unexpected\n"
+                "  example.com/good v2.3.4 // indirect\n"
+                ")\n"
+                "require example.com/also-good v3.4.5\n")
+        self.assertEqual(scan.parse_go_mod(text),
+                         [("Go", "example.com/good", "v2.3.4"),
+                          ("Go", "example.com/also-good", "v3.4.5")])
+
+    def test_go_mod_skips_malformed_require_block_opener(self):
+        text = ("require (unexpected\n"
+                "  example.com/bad v1.2.3\n"
+                ")\n"
+                "require (\n"
+                "  example.com/good v2.3.4\n"
+                ")\n")
+        self.assertEqual(scan.parse_go_mod(text),
+                         [("Go", "example.com/good", "v2.3.4")])
+
     def test_yarn_v1_and_berry(self):
         v1 = 'lodash@^4.17.0, lodash@^4.17.15:\n  version "4.17.21"\n  resolved "x"\n'
         self.assertEqual(scan.parse_yarn_lock(v1), [("npm", "lodash", "4.17.21")])
@@ -574,6 +594,16 @@ class LockfileTests(unittest.TestCase):
                                         "node_modules/a/node_modules/b": {"version": "1.0.0"}}})
         self.assertEqual(sorted(scan.parse_package_lock(lock)),
                          [("npm", "b", "1.0.0"), ("npm", "lodash", "4.17.20")])
+
+    def test_package_lock_with_utf8_bom_is_collected(self):
+        lock = '{"packages":{"node_modules/demo":{"version":"1.2.3"}}}'
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "package-lock.json")
+            with open(path, "wb") as fh:
+                fh.write(b"\xef\xbb\xbf" + lock.encode("utf-8"))
+            self.assertEqual(scan.collect_packages(root, [path]),
+                             {("npm", "demo", "1.2.3"): "package-lock.json"})
+        self.assertEqual(scan.parse_package_lock("\ufeff" + lock[:-1]), [])
 
     def test_scaffold_lockfile_attribution(self):
         """A package@version listed by both a shipped and a fixture lockfile is attributed to the shipped one."""
