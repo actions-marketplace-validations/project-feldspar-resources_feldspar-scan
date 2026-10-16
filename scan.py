@@ -64,7 +64,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.14"
+VERSION = "0.4.15"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -1000,7 +1000,10 @@ def triage_findings(findings):
     per_id = {}
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     dep_upgrade = dep_monitor = dep_scaffold = 0
+    outside_scaffold = {"upgradeable": 0, "monitor_only": 0}
     sec_total = sec_fp = 0
+    sec_review_files = set()
+    secret_fp_reasons = {}
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
     for f in findings:
@@ -1029,6 +1032,8 @@ def triage_findings(findings):
                 t["priority"] = "low"
                 t["reason"] = ("lockfile under a %s path: example/fixture/benchmark scaffold, "
                                "not the shipped dependency graph" % m.group(3).lower())
+            else:
+                outside_scaffold["upgradeable" if fixed else "monitor_only"] += 1
             if lock.endswith("go.sum"):
                 t["note"] += (" Source is go.sum without a go.mod beside it: go.sum also lists "
                               "superseded module versions; confirm with govulncheck.")
@@ -1037,12 +1042,14 @@ def triage_findings(findings):
             is_fp, reason = _secret_false_positive(f)
             if is_fp:
                 sec_fp += 1
+                secret_fp_reasons[reason] = secret_fp_reasons.get(reason, 0) + 1
                 t = {"action": "informational", "likely_false_positive": True,
                      "reason": reason,
                      "note": "Likely not a live secret (%s); verify, but low priority." % reason}
             else:
                 severity = f.get("severity", "unknown")
                 sec_review_by_severity[severity] = sec_review_by_severity.get(severity, 0) + 1
+                sec_review_files.add(f["file"])
                 t = {"action": "review", "likely_false_positive": False,
                      "note": ("In a non-test path; confirm it is not a live credential and, "
                               "if real, rotate it and purge it from history.")}
@@ -1056,10 +1063,13 @@ def triage_findings(findings):
         "by_action": by_action,
         "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
                        "in_scaffold_lockfiles": dep_scaffold},
+        "dependency_outside_scaffold_lockfiles": outside_scaffold,
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
         "secret_review_by_severity": sec_review_by_severity,
+        "secret_files_needing_review": len(sec_review_files),
+        "secret_false_positive_reasons": dict(sorted(secret_fp_reasons.items())),
         "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
                                      dep_scaffold, config_review),
     }
@@ -1189,6 +1199,7 @@ def main(argv):
                                  f["category"], f["file"] or "", f["line"] or 0,
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    files_by_sev = {severity: set() for severity in by_sev}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     highest_severity_by_file = {}
@@ -1196,6 +1207,7 @@ def main(argv):
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+        files_by_sev.setdefault(f["severity"], set()).add(f["file"])
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
         if f["category"] == "secret":
             label = f["summary"]
@@ -1228,6 +1240,11 @@ def main(argv):
             label = f["summary"]
             config_issues_by_rule[label] = config_issues_by_rule.get(label, 0) + 1
 
+    config_files_by_rule = {}
+    for f in findings:
+        if f["category"] == "config":
+            config_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
+
     commit = git_head(root)
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
@@ -1255,10 +1272,16 @@ def main(argv):
             "osv_enabled": use_osv,
             "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
+            "secret_lines": len({(f["file"], f["line"]) for f in findings
+                                 if f["category"] == "secret"}),
             "secret_hits_by_rule": dict(sorted(secret_hits_by_rule.items())),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
+            "config_files_by_rule": {
+                rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
+            },
             "config_issues_by_rule": dict(sorted(config_issues_by_rule.items())),
             "by_severity": by_sev,
+            "files_by_severity": {severity: len(paths) for severity, paths in files_by_sev.items()},
             "highest_severity": findings[0]["severity"] if findings else None,
             "highest_severity_by_file": dict(sorted(highest_severity_by_file.items())),
             "by_category": by_category,

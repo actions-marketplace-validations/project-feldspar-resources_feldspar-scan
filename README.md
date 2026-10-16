@@ -43,7 +43,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.14
+- uses: project-feldspar-resources/feldspar-scan@v0.4.15
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.14`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.15`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -194,6 +194,15 @@ Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 Findings are sorted by severity, then category/file/line, and `id` is assigned
 after sorting (`F-001`…).
 
+For a `dependency-vuln` finding, `file` names one representative manifest for
+the unique `(ecosystem, name, version)` entry, not every manifest containing it.
+The scanner prefers a path outside its test/fixture/example/benchmark path
+heuristic; among paths with the same classification it retains the first in
+sorted relative-path order. Different versions remain separate entries. Thus
+affected-file counts can be smaller than the number of manifests containing an
+affected dependency, even without truncation. `summary.lockfiles_parsed` lists
+processed manifests, but does not map each package to all its occurrences.
+
 `summary.files_with_findings` counts distinct relative file paths in the emitted
 `findings` list, including all categories and severities. Multiple findings in one
 file count once. With scan limits reached, this counts only the files represented
@@ -292,6 +301,29 @@ This summarizes emitted findings only, so finding caps can hide higher-severity
 results. Check `summary.truncated` for incomplete results. Like the overall
 highest severity, this field does not affect `manifest_hash`.
 
+`summary.files_by_severity` counts distinct relative file paths at each raw severity
+(`critical`, `high`, `medium`, `low`, `unknown`), including zero counts. Repeated
+findings at the same severity in one file count once; a file with multiple severities
+counts in each applicable bucket, so the counts can sum to more than
+`summary.files_with_findings`. Counts cover only emitted findings after truncation,
+remain unchanged by `--triage`, and do not affect `manifest_hash` or the severity gate.
+
+`summary.secret_lines` counts distinct `(file, line)` locations in emitted secret
+findings. Several hits on one line count once; the same line number in different
+files counts separately. A multiline private-key finding contributes only its
+reported header line. This is a source-location count, not a count of distinct
+credentials; zero means no emitted secret findings, not complete coverage.
+Finding limits can omit locations. The count includes low-severity hints and is
+unchanged by `--triage`; it does not affect findings, gates or `manifest_hash`.
+
+`summary.config_files_by_rule` maps configuration finding summary labels to
+distinct affected-file counts, in alphabetical label order. Repeated warnings
+for one rule in one file count once; the same file can count under several rules.
+Labels are human-readable descriptions, not stable rule IDs. Only emitted config
+findings count, so scan limits may omit affected files. No config findings yields
+`{}`; this does not certify complete coverage. These counts include all raw
+severities, are unchanged by `--triage`, and do not affect `manifest_hash` or gates.
+
 ### Triage (`--triage`)
 
 With `--triage` the output gains two additive top-level keys and the raw findings
@@ -325,6 +357,31 @@ number of emitted findings, not files or advisory IDs. `review` includes config
 findings; scaffold dependency findings retain their upgrade/monitor action.
 When scan limits truncate the report, these counts cover only emitted findings.
 This field is present only with `--triage` and does not change the severity gate.
+
+`triage_summary.secret_files_needing_review` counts distinct relative file paths
+with emitted secret findings classified as `review`. Repeated hits in one file
+count once; likely-false-positive secrets and non-secret findings do not count.
+It is zero when no secret findings need review. With scan limits reached, it
+counts only files represented in the emitted findings, not omitted files. Like
+the rest of triage, this count does not change findings, the hash, or the gate.
+
+With `--triage`, `triage_summary.dependency_outside_scaffold_lockfiles`
+contains `upgradeable` and `monitor_only` counts for emitted dependency findings
+whose source paths do not match the existing test/example/fixture scaffold
+heuristic. The existing overall dependency counts still include scaffold hits.
+These are finding counts, not advisory counts or recommended target versions;
+multiple advisories grouped into one dependency finding count once. Zero buckets
+are included, and finding caps can make the counts partial. Path classification
+helps prioritize review; it does not establish production use or reachability.
+
+`triage_summary.secret_false_positive_reasons` counts emitted secret findings by
+their existing per-finding `reason`, with keys in sorted order and `{}` when none
+qualify. Each secret counts once: test paths take precedence over test filenames,
+localization paths, and value hints, matching per-finding triage. The counts sum
+to `triage_summary.secrets.likely_false_positive`. These are heuristic reasons,
+not confirmed false positives; review them before dismissing a finding. When
+limits truncate findings, only emitted hits count. This opt-in summary does not
+change raw findings, `manifest_hash`, or the severity gate.
 
 ## What it checks
 
@@ -408,6 +465,22 @@ and `pyproject.toml` still receive secret scanning when otherwise eligible.
 Supported dependency inventory/lookups run independently of this secret-scan
 exclusion. A parsed lockfile with no secret findings does not establish that
 its contents were checked for secrets.
+
+The shared text reader tries UTF-8, then falls back to Latin-1 if UTF-8 decoding
+fails. ASCII token patterns can therefore still match in a Latin-1 file. Any
+NUL byte skips the entire file before decoding, even when a token occurs before
+that byte. Ordinary UTF-16/UTF-32 text containing NUL bytes is skipped rather
+than transcoded. Such a file can still count in `summary.files_scanned`; no
+secret findings (and a successful severity gate) do not establish that its
+contents were assessed.
+
+The `*.min.js` exclusion is a case-sensitive filename suffix check, not content
+analysis: even formatted text named `bundle.min.js` is skipped. Names such as
+`bundle.MIN.JS` and `bundle.min.js.map`, and compact code in ordinary `.js` files,
+are not excluded by this rule; other scan limits still apply. Skipped `.min.js`
+files can count toward `summary.files_scanned` without setting
+`summary.truncated`. Secrets present only in those files cannot trigger the
+severity gate, so a passing gate does not establish that they were checked.
 
 | Pattern | Severity |
 | --- | --- |
