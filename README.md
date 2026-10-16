@@ -66,7 +66,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.17
+- uses: project-feldspar-resources/feldspar-scan@v0.4.18
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -84,7 +84,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.17`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.18`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -400,9 +400,12 @@ severities, are unchanged by `--triage`, and do not affect `manifest_hash` or ga
 With `--triage` the output gains two additive top-level keys and the raw findings
 and `manifest_hash` stay untouched:
 
-- `triage_summary` — counts and a one-line `headline`: dependency advisories split
+- `triage_summary` — counts and a one-line `headline`: dependency findings split
   into `upgradeable` (a patched release exists) vs `monitor_only` (no patch yet),
   and secret hits split into `needs_review` vs `likely_false_positive`.
+  The headline is a human-readable summary whose wording may change between
+  releases; consumers read counts from the structured fields (`triage_summary`,
+  `summary.unique_advisories`), not from the headline.
   `secret_review_by_severity` breaks down the secret hits needing review by
   raw severity (`critical`, `high`, `medium`, `low`, `unknown`, including zeros).
   It excludes likely false positives and counts only emitted findings if the
@@ -656,7 +659,9 @@ a credential is live. Test-path rule also widened in v0.4.1: `__fixtures__`, `__
   does not suppress secret-pattern scanning: a credential-shaped value in an
   otherwise eligible template file can still produce a secret finding and trip
   `--fail-on`. Template filenames do not certify that their contents are safe.
-* `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
+* `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction —
+  low, runtime user unverified (the base image may set `USER`; the scanner does not
+  inspect images).
 * `Dockerfile` with `ADD http(s)://…` — low.
 * `Dockerfile` (or `Dockerfile.*`) whose final stage's last explicit `USER`
   is `root` or `0`, optionally with a group suffix — low. Earlier stages and

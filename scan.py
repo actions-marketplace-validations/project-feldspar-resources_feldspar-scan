@@ -72,7 +72,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.17"
+VERSION = "0.4.18"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -879,7 +879,7 @@ def _scan_dockerfile(text, rel, add):
     instructions = list(_docker_instructions(text))
     if not any(op == 'USER' for _, op, _ in instructions):
         add('config', 'low', rel, None,
-            summary='Dockerfile has no USER instruction (runs as root)',
+            summary='Dockerfile has no USER instruction (runtime user unverified)',
             evidence='no USER directive')
     stages = set()
     final_user = None
@@ -992,9 +992,9 @@ def _secret_false_positive(f):
 def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0, config_review=0):
     parts = []
     if up:
-        parts.append("%d dependency advisory/ies fixable by upgrade" % up)
+        parts.append("%d dependency finding(s) fixable by upgrade" % up)
     if mon:
-        parts.append("%d dependency advisory/ies with no patch yet (monitor/mitigate)" % mon)
+        parts.append("%d dependency finding(s) with no patch yet (monitor/mitigate)" % mon)
     if scaffold:
         parts.append("%d of the dependency hits are in example/fixture/benchmark lockfiles (low priority)" % scaffold)
     if sec_review:

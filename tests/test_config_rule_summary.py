@@ -47,7 +47,7 @@ class ConfigRuleSummaryTests(unittest.TestCase):
         self.assertEqual((status, gated_status, critical_status), (0, 1, 0))
         self.assert_counts(plain, {
             'Committed .env file with assignments': 2,
-            'Dockerfile has no USER instruction (runs as root)': 1})
+            'Dockerfile has no USER instruction (runtime user unverified)': 1})
         self.assertEqual(plain['summary']['secret_hits'], 1)
         self.assertNotIn('gate', plain['summary'])
         self.assertEqual(triaged['summary']['gate'],
