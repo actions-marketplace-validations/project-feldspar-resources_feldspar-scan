@@ -30,6 +30,10 @@ JSON is printed to stdout by default. Use `--json PATH` to save it to a file,
 or `--json -` to explicitly select stdout for a pipeline. Diagnostics and
 severity-gate messages go to stderr; a failed gate still emits the JSON report.
 To write a literal file named `-`, use `--json ./-`.
+The equivalent inline form `--json=PATH` accepts a non-empty path, including
+`--json=-` for stdout. Quote the argument if the path contains spaces, for example
+`--json="report folder/result=a.json"`; equals signs within the path are preserved.
+An empty `--json=` is an argument error (exit 2) before scanning or cloning.
 
 Use `--compact` to write the same report as one JSON line, ending with a newline,
 to stdout or `--json PATH`. The default remains indented JSON. This changes only
@@ -43,7 +47,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.15
+- uses: project-feldspar-resources/feldspar-scan@v0.4.16
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +65,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.15`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.16`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -100,6 +104,11 @@ Local/stdio alternative: `python3 web/mcp_stdio.py` (same tools over stdin/stdou
 the image is not yet exercised here because Docker is not installed on my host).
 Server source: `web/server.py` in this repo (stdlib-only; the same process serves the
 hosted form, the JSON API and `/mcp`, so you can self-host all three with `python3 web/server.py`).
+
+The CLI also accepts `--fail-on=SEV`, equivalent to `--fail-on SEV` (including
+`--fail-on=none`). Values are case-insensitive. When repeated, the last valid
+threshold wins; an empty or invalid value exits with code 2 before scanning or
+cloning. The inline spelling preserves the report and severity-gate behavior.
 
 Exit codes: `0` ok, `1` gate tripped (`--fail-on`), `2` bad args / bad path,
 `3` clone failed. Without `--fail-on`, or with explicit `--fail-on none`, a non-zero
@@ -383,6 +392,15 @@ not confirmed false positives; review them before dismissing a finding. When
 limits truncate findings, only emitted hits count. This opt-in summary does not
 change raw findings, `manifest_hash`, or the severity gate.
 
+`summary.secret_files_by_rule` maps secret finding summary labels to distinct
+affected-file counts, in alphabetical label order. Repeated hits for one label
+in one file count once; the same file can count under several labels. Labels are
+human-readable descriptions, not stable rule IDs. Counts include all emitted
+secret findings, including low-severity and likely-false-positive hits, and are
+unchanged by `--triage`. Scan limits may omit affected files. No secret findings
+yields `{}`; this does not certify complete coverage. This summary does not change
+findings, redaction, `manifest_hash`, or severity gates.
+
 ## What it checks
 
 ### 1. `dependency-vuln`
@@ -657,6 +675,17 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   Untracked and ignored regular files are scanned too, subject to the scanner's
   directory/file exclusions and size/count limits. Findings in those files can
   trigger `--fail-on`; an ignored local file is not evidence that it was committed.
+* **Directory exclusions apply at every depth below the scan target.** The exact,
+  case-sensitive names are `.git`, `node_modules`, `vendor`, `dist`, `build`,
+  `.venv`, `venv`, `__pycache__`, `.mypy_cache`, `.tox`, `.next`, and `target`.
+  Their subtrees are omitted from dependency inventory, secret checks and config
+  checks, even beneath a directory such as `src/`. Similar names (`Vendor`,
+  `vendor-copy`, `myvenv`) and other dot-directories are not excluded by this rule.
+  The explicitly selected target itself is not filtered by its basename: scanning
+  `vendor/` directly examines its contents, while still excluding matching child
+  directories. Excluded files do not count in `summary.files_scanned` and these
+  exclusions do not set `summary.truncated`. An empty report and passing severity
+  gate therefore do not establish coverage of excluded subtrees.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
   Requirements environment markers after `;` are discarded without evaluation:

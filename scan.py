@@ -9,11 +9,13 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
 
   -h, --help      show this help; also accepted after the target.
   --json PATH     write JSON to PATH; use - for stdout (also the default).
+                  Also accepts --json=PATH; PATH must be non-empty.
   --compact       write JSON on one line, to stdout or --json PATH.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
+                  Also accepts --fail-on=SEV.
                   Use none to disable the gate (the default); findings are still reported.
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
@@ -64,7 +66,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.15"
+VERSION = "0.4.16"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -296,6 +298,8 @@ def parse_pnpm_lock(text):
     out = []
     in_pkgs = False
     for line in text.splitlines():
+        if line.startswith("#"):
+            continue  # Unindented comments do not end the packages section.
         if re.match(r"^packages:\s*$", line):
             in_pkgs = True
             continue
@@ -539,6 +543,7 @@ EXAMPLE_KEYS = {
 }
 MASKED_RE = re.compile(r"x{6,}|X{6,}|0{8,}|\*{4,}|EXAMPLE")
 # Match only an open value in the prefix before a hit, not a closed earlier field.
+# Search with a start position so lookbehind retains context before the 40-char window.
 PLACEHOLDER_ATTR_RE = re.compile(
     r"""(?<![\w-])placeholder\s*[:=]\s*(?:"[^"]*|'[^']*|\{[^}]*)$""", re.I)
 
@@ -561,7 +566,7 @@ def _value_hint(value, line_prefix=""):
         # home-assistant dataset: `ATTR_TOKEN = "long_lived_access_token"`, growatt field names,
         # header names — identifiers, not credentials (random credentials carry digits)
         return "word-like?"
-    if PLACEHOLDER_ATTR_RE.search(line_prefix[-40:]):
+    if PLACEHOLDER_ATTR_RE.search(line_prefix, max(0, len(line_prefix) - 40)):
         return "form-placeholder?"
     return None
 
@@ -570,7 +575,7 @@ def _pattern_hint(matched, line_prefix=""):
     """Shape hint for a fixed-pattern hit (AWS/Slack/GitHub…): documented example or masked value."""
     if matched in EXAMPLE_KEYS or MASKED_RE.search(matched):
         return "example-key?"
-    if PLACEHOLDER_ATTR_RE.search(line_prefix[-40:]):
+    if PLACEHOLDER_ATTR_RE.search(line_prefix, max(0, len(line_prefix) - 40)):
         return "form-placeholder?"
     return None
 
@@ -1101,12 +1106,20 @@ def main(argv):
     compact = False
     i = 1
     while i < len(args):
+        if args[i].startswith("--fail-on="):
+            args[i:i + 1] = args[i].split("=", 1)
         if args[i] in ("-h", "--help"):
             print(__doc__.strip())
             return 0
         if args[i] == "--json" and i + 1 < len(args):
             out_path = args[i + 1]
             i += 2
+        elif args[i].startswith("--json="):
+            out_path = args[i].split("=", 1)[1]
+            if not out_path:
+                sys.stderr.write("--json requires a non-empty path" + chr(10))
+                return 2
+            i += 1
         elif args[i] == "--no-osv":
             use_osv = False
             i += 1
@@ -1245,6 +1258,11 @@ def main(argv):
         if f["category"] == "config":
             config_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
 
+    secret_files_by_rule = {}
+    for f in findings:
+        if f["category"] == "secret":
+            secret_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
+
     commit = git_head(root)
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
@@ -1275,6 +1293,9 @@ def main(argv):
             "secret_lines": len({(f["file"], f["line"]) for f in findings
                                  if f["category"] == "secret"}),
             "secret_hits_by_rule": dict(sorted(secret_hits_by_rule.items())),
+            "secret_files_by_rule": {
+                rule: len(paths) for rule, paths in sorted(secret_files_by_rule.items())
+            },
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "config_files_by_rule": {
                 rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
