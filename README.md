@@ -43,7 +43,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.9
+- uses: project-feldspar-resources/feldspar-scan@v0.4.10
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.9`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.10`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -151,6 +151,13 @@ after sorting (`F-001`…).
 file count once. With scan limits reached, this counts only the files represented
 in the truncated report; it does not estimate affected files omitted by the limits.
 
+`summary.findings_by_file` maps relative file paths to emitted finding counts,
+with paths sorted lexically. It includes all categories and severities, omits
+files with no findings, and is `{}` for an empty report. Counts sum to the length
+of `findings`; a dependency finding with multiple advisories counts once. Scan
+limits restrict these counts to retained findings, and the mapping does not
+change with `--triage` or affect `manifest_hash`.
+
 `summary.files_with_findings_by_category` counts distinct relative file paths for
 each of `dependency-vuln`, `secret`, and `config`, including zero counts. Repeated
 findings in one file count once within each category; a file with both secret and
@@ -181,6 +188,14 @@ entries before finding limits. File and finding limits bound the advisory count.
 Zero means no advisory IDs were emitted, including with `--no-osv`; it does not
 certify coverage or successful lookups. Check errors, notes and truncation flags.
 This summary field does not affect `manifest_hash`.
+
+When `--fail-on` is supplied, `summary.gate` records the normalized `threshold`,
+the number of emitted raw findings at or above it (`matching_findings`), and
+`passed` (true when that count is zero). `unknown` never matches a threshold;
+`--triage` does not change the gate. The field is omitted without `--fail-on`
+and does not affect `manifest_hash`. Passing describes the exit-code gate,
+not complete coverage: review errors, notes and truncation flags, since discarded
+findings cannot contribute to the count.
 
 ### Triage (`--triage`)
 
@@ -335,6 +350,10 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
   uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
   `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
 * `.npmrc` / `.pypirc` containing `_authToken=` or a `password` line — high.
+  Spaces or tabs before `=` are also accepted for an unscoped or registry-scoped
+  `_authToken` key beginning the line after optional whitespace. The legacy exact
+  `_authToken=` substring check remains; spaced markers inside other option names,
+  values, or trailing comments do not trigger the added whitespace form.
   Empty or whitespace-only `password=` / `password:` fields are ignored;
   later credential lines are still checked. Quoted values and inline comments
   after the delimiter remain nonempty for this conservative heuristic.

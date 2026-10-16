@@ -58,7 +58,11 @@ beta==1.0
         self.assertEqual(plain['summary']['vulnerable_packages'], 3)
         self.assertEqual(sum(len(f['vuln_ids']) for f in plain['findings']), 5)
         self.assertEqual(plain['findings'], triaged['findings'])
-        self.assertEqual(plain['summary'], triaged['summary'])
+        self.assertNotIn('gate', plain['summary'])
+        self.assertEqual(triaged['summary'], {
+            **plain['summary'],
+            'gate': {'threshold': 'high', 'matching_findings': 3, 'passed': False},
+        })
         self.assertEqual(plain['manifest_hash'], triaged['manifest_hash'])
         canonical = json.dumps({k: plain[k] for k in ('findings', 'target', 'commit')},
                                sort_keys=True, separators=(',', ':'))

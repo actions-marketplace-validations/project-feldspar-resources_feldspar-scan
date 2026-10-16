@@ -545,6 +545,16 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(scan.parse_go_mod(text),
                          [("Go", "example.com/good", "v2.3.4")])
 
+    def test_gemfile_ignores_git_and_path_specs(self):
+        text = ("GIT\n  remote: https://example.invalid/repo.git\n  specs:\n"
+                "    git-gem (1.0.0)\n\n"
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n"
+                "    registry-gem (2.0.0)\n\n"
+                "PATH\n  remote: ../local\n  specs:\n"
+                "    local-gem (3.0.0)\n")
+        self.assertEqual(scan.parse_gemfile_lock(text),
+                         [("RubyGems", "registry-gem", "2.0.0")])
+
     def test_yarn_v1_and_berry(self):
         v1 = 'lodash@^4.17.0, lodash@^4.17.15:\n  version "4.17.21"\n  resolved "x"\n'
         self.assertEqual(scan.parse_yarn_lock(v1), [("npm", "lodash", "4.17.21")])
@@ -795,6 +805,16 @@ class CliTests(unittest.TestCase):
     def test_bad_target_and_unknown_arg(self):
         self.assertEqual(_run(os.path.join(ROOT, "does-not-exist"), "--no-osv")[0], 2)
         self.assertEqual(_run(FIXTURE, "--no-osv", "--bogus")[0], 2)
+
+
+class GoSumTruncationTests(unittest.TestCase):
+    def test_empty_hash_and_version_are_skipped(self):
+        text = """example.com/good v1.2.3 h1:abc=
+example.com/empty-hash v2.0.0 h1:
+example.com/empty-version v h1:abc=
+example.com/empty-mod-version v/go.mod h1:abc=
+"""
+        self.assertEqual(scan.parse_go_sum(text), [("Go", "example.com/good", "v1.2.3")])
 
 
 if __name__ == "__main__":

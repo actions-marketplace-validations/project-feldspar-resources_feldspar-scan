@@ -23,6 +23,11 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                   v0.4: dependency hits from lockfiles under test/fixture/example/benchmark
                   paths are tagged scaffold (low priority).
 
+Exit codes: 0 no severity gate fired; 1 gate fired (--fail-on);
+            2 bad args / bad path; 3 clone failed.
+Without --fail-on, findings do not change the exit code. Code 0 does not certify a complete assessment.
+Review errors, summary.notes, summary.lockfiles_parsed, and summary.packages_found in the report.
+
 v0.4 (2026-10-08, from the 25-repo dataset in datasets/): go.mod is the Go build list and is
 preferred over go.sum (which lists superseded versions too); Yarn Berry lockfiles are parsed;
 `summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed.
@@ -57,7 +62,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.9"
+VERSION = "0.4.10"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -253,8 +258,13 @@ def parse_yarn_lock(text):
             if not line.rstrip().endswith(":"):
                 continue
             spec = line.rstrip()[:-1]
+            if spec.startswith('"') and spec.endswith('"') and spec.count('"') == 2:
+                spec = spec[1:-1]  # Yarn can quote the entire comma-separated descriptor list.
             for part in spec.split(","):
-                part = part.strip().strip('"')
+                part = part.strip()
+                if part.startswith('"') != part.endswith('"'):
+                    continue  # An unbalanced quoted descriptor is incomplete.
+                part = part.strip('"')
                 if not part:
                     continue
                 # split at the FIRST "@" after the (possibly @scoped/) name: a Berry
@@ -315,12 +325,12 @@ def parse_go_sum(text):
         parts = line.split()
         # A go.sum record has exactly a module, version, and h1 checksum.
         # Ignore truncated or malformed records instead of reporting a dependency.
-        if len(parts) != 3 or not parts[2].startswith("h1:"):
+        if len(parts) != 3 or not parts[2].startswith("h1:") or len(parts[2]) == 3:
             continue
         mod, ver = parts[0], parts[1]
         if ver.endswith("/go.mod"):
             ver = ver[: -len("/go.mod")]
-        if mod and ver.startswith("v"):
+        if mod and ver.startswith("v") and len(ver) > 1:
             out.append(("Go", mod, ver))
     return out
 
@@ -351,13 +361,16 @@ def parse_go_mod(text):
 
 def parse_gemfile_lock(text):
     out = []
+    in_gem = False
     in_specs = False
     for line in text.splitlines():
-        if re.match(r"^\s{2}specs:\s*$", line):
+        if line and not line[0].isspace():
+            in_gem = line == "GEM"
+            in_specs = False
+            continue
+        if in_gem and re.match(r"^\s{2}specs:\s*$", line):
             in_specs = True
             continue
-        if line and not line.startswith(" "):
-            in_specs = False
         if not in_specs:
             continue
         m = re.match(r"^\s{4}([A-Za-z0-9_.\-]+) \(([^)]+)\)\s*$", line)
@@ -570,7 +583,7 @@ SECRET_PATTERNS = [
      "high", "GitHub token"),
     ("github-pat", re.compile(r"(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{80,}(?![A-Za-z0-9_])"),
      "high", "GitHub fine-grained PAT"),
-    ("gitlab-pat", re.compile(r"(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20}(?![A-Za-z0-9_-])"),
+    ("gitlab-pat", re.compile(r"(?<![\w-])glpat-[A-Za-z0-9_-]{20}(?![\w-])"),
      "high", "GitLab personal access token"),
     ("npm-token", re.compile(r"(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9_])"),
      "high", "npm access token"),
@@ -597,9 +610,10 @@ SECRET_PATTERNS = [
     ("private-key", re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
      "critical", "Private key block"),
 ]
+# Unicode alphanumerics extend a name; underscores remain suffix separators.
 GENERIC = re.compile(
-    r"""(?i)(?<![A-Za-z0-9])(?P<quote>['"]?)(?P<name>api[_-]?key|secret|password|passwd|token)(?P=quote)"""
-    r"""\s*[:=]\s*['"](?P<value>[^'"\s]{16,})['"]""")
+    r"""(?i)(?<![^\W_])(?P<quote>['"]?)(?P<name>api[_-]?key|secret|password|passwd|token)(?P=quote)"""
+    r"""\s*[:=]\s*(?P<value_quote>['"])(?P<value>[^'"\s]{16,})(?P=value_quote)""")
 PRIVATE_KEY_BLOCK = re.compile(
     r"^[ \t]*-----BEGIN (?P<label>[A-Z ]*PRIVATE KEY)-----[ \t]*\r?\n"
     r"(?P<body>(?:[ \t]*[A-Za-z0-9+/=_.*-]+[ \t]*\r?\n)+)"
@@ -797,11 +811,13 @@ def scan_config(root, files, add):
                 if line.lstrip().startswith(("#", ";")):
                     continue
                 if base == ".npmrc" and re.fullmatch(
-                        r"\s*(?://[^\s=]+:)?_authToken=\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}\s*", line):
+                        r"\s*(?://[^\s=]+:)?_authToken[ \t]*=\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}\s*", line):
                     continue  # A standalone environment reference contains no literal credential.
                 if re.fullmatch(r"\s*password\s*[:=]\s*", line, re.I):
                     continue  # An empty password field contains no credential.
-                if "_authToken=" in line or re.match(r"^\s*password\s*[:=]", line, re.I):
+                if ("_authToken=" in line
+                        or re.match(r"^\s*(?://[^\s=]+:)?_authToken[ \t]+=", line)
+                        or re.match(r"^\s*password\s*[:=]", line, re.I)):
                     add("config", "high", rel, lineno,
                         summary="Credential committed in %s" % base,
                         evidence=redact(line.strip()))
@@ -1177,6 +1193,7 @@ def main(argv):
         "summary": {
             "files_scanned": len(files),
             "files_with_findings": len({f["file"] for f in findings}),
+            "findings_by_file": dict(sorted(findings_per_file.items())),
             "files_with_findings_by_category": {
                 category: len({f["file"] for f in findings if f["category"] == category})
                 for category in by_category
@@ -1199,6 +1216,15 @@ def main(argv):
         },
         "findings": findings,
     }
+    gate_matches = 0
+    if fail_on is not None:
+        gate_matches = sum(1 for f in findings
+                           if SEV_ORDER.get(f["severity"], 99) <= SEV_ORDER[fail_on])
+        doc["summary"]["gate"] = {
+            "threshold": fail_on,
+            "matching_findings": gate_matches,
+            "passed": gate_matches == 0,
+        }
     if not PARSED_LOCKFILES:
         # a zero must not read as "clean" (dataset 2026-10-08: 3 of 25 repos scanned 0 packages)
         doc["summary"]["notes"] = [
