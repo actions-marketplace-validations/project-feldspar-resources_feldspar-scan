@@ -2,17 +2,26 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage] [--compact]
+               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty] [--sort-keys]
        scan.py --version
+
+For local directories named -h, --help, or --version, use an explicit path:
+./-h, ./--help, or ./--version (for example: scan.py ./--help --no-osv).
 
   --version       print scanner name and version, then exit (standalone invocation).
 
+  -h, --help      show this help; also accepted after the target.
   --json PATH     write JSON to PATH; use - for stdout (also the default).
+                  Also accepts --json=PATH; PATH must be non-empty.
   --compact       write JSON on one line, to stdout or --json PATH.
+  --pretty        write indented JSON (the default); last formatting flag wins.
+  --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
+                  Also accepts --fail-on=SEV.
+                  Use none to disable the gate (the default); findings are still reported.
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
                   "triage_summary"): classifies secret hits in test/fixture/example
@@ -22,6 +31,7 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                   manifest_hash are unchanged; triage is a separate, additive section.
                   v0.4: dependency hits from lockfiles under test/fixture/example/benchmark
                   paths are tagged scaffold (low priority).
+  --no-triage     omit the interpretation layer (the default); last triage flag wins.
 
 Exit codes: 0 no severity gate fired; 1 gate fired (--fail-on);
             2 bad args / bad path; 3 clone failed.
@@ -62,7 +72,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.13"
+VERSION = "0.4.19"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -294,6 +304,8 @@ def parse_pnpm_lock(text):
     out = []
     in_pkgs = False
     for line in text.splitlines():
+        if line.startswith("#"):
+            continue  # Unindented comments do not end the packages section.
         if re.match(r"^packages:\s*$", line):
             in_pkgs = True
             continue
@@ -352,7 +364,7 @@ def parse_go_mod(text):
         m = None
         if in_req:
             m = re.match(r"^(\S+)\s+(v\S+)$", s)
-        elif s.startswith("require "):
+        else:
             m = re.match(r"^require\s+(\S+)\s+(v\S+)$", s)
         if m:
             out.append(("Go", m.group(1), m.group(2)))
@@ -537,6 +549,7 @@ EXAMPLE_KEYS = {
 }
 MASKED_RE = re.compile(r"x{6,}|X{6,}|0{8,}|\*{4,}|EXAMPLE")
 # Match only an open value in the prefix before a hit, not a closed earlier field.
+# Search with a start position so lookbehind retains context before the 40-char window.
 PLACEHOLDER_ATTR_RE = re.compile(
     r"""(?<![\w-])placeholder\s*[:=]\s*(?:"[^"]*|'[^']*|\{[^}]*)$""", re.I)
 
@@ -559,7 +572,7 @@ def _value_hint(value, line_prefix=""):
         # home-assistant dataset: `ATTR_TOKEN = "long_lived_access_token"`, growatt field names,
         # header names — identifiers, not credentials (random credentials carry digits)
         return "word-like?"
-    if PLACEHOLDER_ATTR_RE.search(line_prefix[-40:]):
+    if PLACEHOLDER_ATTR_RE.search(line_prefix, max(0, len(line_prefix) - 40)):
         return "form-placeholder?"
     return None
 
@@ -568,7 +581,7 @@ def _pattern_hint(matched, line_prefix=""):
     """Shape hint for a fixed-pattern hit (AWS/Slack/GitHub…): documented example or masked value."""
     if matched in EXAMPLE_KEYS or MASKED_RE.search(matched):
         return "example-key?"
-    if PLACEHOLDER_ATTR_RE.search(line_prefix[-40:]):
+    if PLACEHOLDER_ATTR_RE.search(line_prefix, max(0, len(line_prefix) - 40)):
         return "form-placeholder?"
     return None
 
@@ -817,8 +830,8 @@ def scan_config(root, files, add):
                     continue  # A standalone environment reference contains no literal credential.
                 if re.fullmatch(r"\s*password\s*[:=]\s*", line, re.I):
                     continue  # An empty password field contains no credential.
-                if ("_authToken=" in line
-                        or re.match(r"^\s*(?://[^\s=]+:)?_authToken[ \t]+=", line)
+                if ((base == ".pypirc" and "_authToken=" in line)
+                        or re.match(r"^\s*(?://[^\s=]+:)?_authToken[ \t]*=", line)
                         or re.match(r"^\s*password\s*[:=]", line, re.I)):
                     add("config", "high", rel, lineno,
                         summary="Credential committed in %s" % base,
@@ -866,7 +879,7 @@ def _scan_dockerfile(text, rel, add):
     instructions = list(_docker_instructions(text))
     if not any(op == 'USER' for _, op, _ in instructions):
         add('config', 'low', rel, None,
-            summary='Dockerfile has no USER instruction (runs as root)',
+            summary='Dockerfile has no USER instruction (runtime user unverified)',
             evidence='no USER directive')
     stages = set()
     final_user = None
@@ -979,9 +992,9 @@ def _secret_false_positive(f):
 def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0, config_review=0):
     parts = []
     if up:
-        parts.append("%d dependency advisory/ies fixable by upgrade" % up)
+        parts.append("%d dependency finding(s) fixable by upgrade" % up)
     if mon:
-        parts.append("%d dependency advisory/ies with no patch yet (monitor/mitigate)" % mon)
+        parts.append("%d dependency finding(s) with no patch yet (monitor/mitigate)" % mon)
     if scaffold:
         parts.append("%d of the dependency hits are in example/fixture/benchmark lockfiles (low priority)" % scaffold)
     if sec_review:
@@ -998,7 +1011,11 @@ def triage_findings(findings):
     per_id = {}
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     dep_upgrade = dep_monitor = dep_scaffold = 0
+    outside_scaffold = {"upgradeable": 0, "monitor_only": 0}
     sec_total = sec_fp = 0
+    sec_review_files = set()
+    secret_fp_reasons = {}
+    sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
     for f in findings:
         cat = f["category"]
@@ -1026,6 +1043,8 @@ def triage_findings(findings):
                 t["priority"] = "low"
                 t["reason"] = ("lockfile under a %s path: example/fixture/benchmark scaffold, "
                                "not the shipped dependency graph" % m.group(3).lower())
+            else:
+                outside_scaffold["upgradeable" if fixed else "monitor_only"] += 1
             if lock.endswith("go.sum"):
                 t["note"] += (" Source is go.sum without a go.mod beside it: go.sum also lists "
                               "superseded module versions; confirm with govulncheck.")
@@ -1034,10 +1053,14 @@ def triage_findings(findings):
             is_fp, reason = _secret_false_positive(f)
             if is_fp:
                 sec_fp += 1
+                secret_fp_reasons[reason] = secret_fp_reasons.get(reason, 0) + 1
                 t = {"action": "informational", "likely_false_positive": True,
                      "reason": reason,
                      "note": "Likely not a live secret (%s); verify, but low priority." % reason}
             else:
+                severity = f.get("severity", "unknown")
+                sec_review_by_severity[severity] = sec_review_by_severity.get(severity, 0) + 1
+                sec_review_files.add(f["file"])
                 t = {"action": "review", "likely_false_positive": False,
                      "note": ("In a non-test path; confirm it is not a live credential and, "
                               "if real, rotate it and purge it from history.")}
@@ -1051,9 +1074,13 @@ def triage_findings(findings):
         "by_action": by_action,
         "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
                        "in_scaffold_lockfiles": dep_scaffold},
+        "dependency_outside_scaffold_lockfiles": outside_scaffold,
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
+        "secret_review_by_severity": sec_review_by_severity,
+        "secret_files_needing_review": len(sec_review_files),
+        "secret_false_positive_reasons": dict(sorted(secret_fp_reasons.items())),
         "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
                                      dep_scaffold, config_review),
     }
@@ -1082,25 +1109,47 @@ def main(argv):
         return 0
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
-    compact = False
+    compact = sort_keys = False
     i = 1
     while i < len(args):
+        if args[i].startswith("--fail-on="):
+            args[i:i + 1] = args[i].split("=", 1)
+        if args[i] in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
         if args[i] == "--json" and i + 1 < len(args):
             out_path = args[i + 1]
             i += 2
+        elif args[i].startswith("--json="):
+            out_path = args[i].split("=", 1)[1]
+            if not out_path:
+                sys.stderr.write("--json requires a non-empty path" + chr(10))
+                return 2
+            i += 1
         elif args[i] == "--no-osv":
             use_osv = False
             i += 1
         elif args[i] == "--triage":
             triage = True
             i += 1
+        elif args[i] == "--no-triage":
+            triage = False
+            i += 1
         elif args[i] == "--compact":
             compact = True
             i += 1
+        elif args[i] == "--pretty":
+            compact = False
+            i += 1
+        elif args[i] == "--sort-keys":
+            sort_keys = True
+            i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
-            if fail_on not in SEV_ORDER:
-                sys.stderr.write("--fail-on must be one of critical|high|medium|low\n")
+            if fail_on == "none":
+                fail_on = None
+            elif fail_on not in SEV_ORDER:
+                sys.stderr.write("--fail-on must be one of critical|high|medium|low|none\n")
                 return 2
             i += 2
         else:
@@ -1178,13 +1227,23 @@ def main(argv):
                                  f["category"], f["file"] or "", f["line"] or 0,
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    files_by_sev = {severity: set() for severity in by_sev}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     highest_severity_by_file = {}
+    secret_hits_by_rule = {}
+    dependency_findings_by_ecosystem = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+        files_by_sev.setdefault(f["severity"], set()).add(f["file"])
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
+        if f["category"] == "dependency-vuln":
+            ecosystem = f["ecosystem"]
+            dependency_findings_by_ecosystem[ecosystem] = dependency_findings_by_ecosystem.get(ecosystem, 0) + 1
+        if f["category"] == "secret":
+            label = f["summary"]
+            secret_hits_by_rule[label] = secret_hits_by_rule.get(label, 0) + 1
         # Findings are already sorted from highest to lowest severity.
         highest_severity_by_file.setdefault(f["file"], f["severity"])
         counts = by_category_severity.setdefault(f["category"], dict.fromkeys(by_sev, 0))
@@ -1207,11 +1266,28 @@ def main(argv):
         context = "scaffold" if TEST_PATH_RE.search(manifest) else "other"
         packages_by_path_context[context] += 1
 
+    config_issues_by_rule = {}
+    for f in findings:
+        if f["category"] == "config":
+            label = f["summary"]
+            config_issues_by_rule[label] = config_issues_by_rule.get(label, 0) + 1
+
+    config_files_by_rule = {}
+    for f in findings:
+        if f["category"] == "config":
+            config_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
+
+    secret_files_by_rule = {}
+    for f in findings:
+        if f["category"] == "secret":
+            secret_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
+
     commit = git_head(root)
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
+            "total_findings": len(findings),
             "files_scanned": len(files),
             "files_with_findings": len({f["file"] for f in findings}),
             "findings_by_file": dict(sorted(findings_per_file.items())),
@@ -1227,15 +1303,31 @@ def main(argv):
             "vulnerable_packages": len(vulnerable),
             "dependency_findings_with_fixes": sum(
                 1 for f in findings if f["category"] == "dependency-vuln" and f["fixed_in"]),
+            "dependency_findings_without_fixes": sum(
+                1 for f in findings if f["category"] == "dependency-vuln" and not f["fixed_in"]),
             "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
+            "dependency_findings_by_ecosystem": dict(sorted(dependency_findings_by_ecosystem.items())),
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"
                                       for vid in f["vuln_ids"]}),
             "osv_enabled": use_osv,
             "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
+            "secret_lines": len({(f["file"], f["line"]) for f in findings
+                                 if f["category"] == "secret"}),
+            "secret_hits_by_rule": dict(sorted(secret_hits_by_rule.items())),
+            "secret_files_by_rule": {
+                rule: len(paths) for rule, paths in sorted(secret_files_by_rule.items())
+            },
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
+            "config_lines": len({(f["file"], f["line"]) for f in findings
+                                 if f["category"] == "config" and f["line"] is not None}),
+            "config_files_by_rule": {
+                rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
+            },
+            "config_issues_by_rule": dict(sorted(config_issues_by_rule.items())),
             "by_severity": by_sev,
+            "files_by_severity": {severity: len(paths) for severity, paths in files_by_sev.items()},
             "highest_severity": findings[0]["severity"] if findings else None,
             "highest_severity_by_file": dict(sorted(highest_severity_by_file.items())),
             "by_category": by_category,
@@ -1275,7 +1367,8 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    text = json.dumps(doc, separators=(",", ":")) if compact else json.dumps(doc, indent=2)
+    text = (json.dumps(doc, separators=(",", ":"), sort_keys=sort_keys) if compact
+            else json.dumps(doc, indent=2, sort_keys=sort_keys))
     if out_path and out_path != "-":
         with open(out_path, "w") as fh:
             fh.write(text + "\n")

@@ -34,12 +34,12 @@ class NpmConsolidationTests(unittest.TestCase):
                 self.assertEqual(hits[0]["severity"], "high")
                 self.assertEqual(hits, self.findings(text + chr(10) + text, name))
 
-    def test_new_spacing_is_anchored_while_legacy_substring_is_preserved(self):
+    def test_npmrc_markers_are_anchored_while_pypirc_substring_is_preserved(self):
         for name in (".npmrc", ".pypirc"):
             for prefix in ("other_authToken", "message=_authToken", "registry=x # _authToken"):
                 with self.subTest(name=name, prefix=prefix):
                     value = "synthetic-value-12345"
-                    self.assertEqual(len(self.findings(prefix + "=" + value, name)), 1)
+                    self.assertEqual(len(self.findings(prefix + "=" + value, name)), 0 if name == ".npmrc" else 1)
                     self.assertEqual(self.findings(prefix + " = " + value, name), [])
                     hits = self.findings(prefix + " = " + value + chr(10)
                                          + "_authToken = " + value, name)
