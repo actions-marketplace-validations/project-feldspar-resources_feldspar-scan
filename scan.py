@@ -7,12 +7,14 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
 
   --version       print scanner name and version, then exit (standalone invocation).
 
+  -h, --help      show this help; also accepted after the target.
   --json PATH     write JSON to PATH; use - for stdout (also the default).
   --compact       write JSON on one line, to stdout or --json PATH.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
+                  Use none to disable the gate (the default); findings are still reported.
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
                   "triage_summary"): classifies secret hits in test/fixture/example
@@ -62,7 +64,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.13"
+VERSION = "0.4.14"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -999,6 +1001,7 @@ def triage_findings(findings):
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     dep_upgrade = dep_monitor = dep_scaffold = 0
     sec_total = sec_fp = 0
+    sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
     for f in findings:
         cat = f["category"]
@@ -1038,6 +1041,8 @@ def triage_findings(findings):
                      "reason": reason,
                      "note": "Likely not a live secret (%s); verify, but low priority." % reason}
             else:
+                severity = f.get("severity", "unknown")
+                sec_review_by_severity[severity] = sec_review_by_severity.get(severity, 0) + 1
                 t = {"action": "review", "likely_false_positive": False,
                      "note": ("In a non-test path; confirm it is not a live credential and, "
                               "if real, rotate it and purge it from history.")}
@@ -1054,6 +1059,7 @@ def triage_findings(findings):
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
+        "secret_review_by_severity": sec_review_by_severity,
         "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
                                      dep_scaffold, config_review),
     }
@@ -1085,6 +1091,9 @@ def main(argv):
     compact = False
     i = 1
     while i < len(args):
+        if args[i] in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
         if args[i] == "--json" and i + 1 < len(args):
             out_path = args[i + 1]
             i += 2
@@ -1099,8 +1108,10 @@ def main(argv):
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
-            if fail_on not in SEV_ORDER:
-                sys.stderr.write("--fail-on must be one of critical|high|medium|low\n")
+            if fail_on == "none":
+                fail_on = None
+            elif fail_on not in SEV_ORDER:
+                sys.stderr.write("--fail-on must be one of critical|high|medium|low|none\n")
                 return 2
             i += 2
         else:
@@ -1181,10 +1192,14 @@ def main(argv):
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     highest_severity_by_file = {}
+    secret_hits_by_rule = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
+        if f["category"] == "secret":
+            label = f["summary"]
+            secret_hits_by_rule[label] = secret_hits_by_rule.get(label, 0) + 1
         # Findings are already sorted from highest to lowest severity.
         highest_severity_by_file.setdefault(f["file"], f["severity"])
         counts = by_category_severity.setdefault(f["category"], dict.fromkeys(by_sev, 0))
@@ -1206,6 +1221,12 @@ def main(argv):
     for manifest in pkgs.values():
         context = "scaffold" if TEST_PATH_RE.search(manifest) else "other"
         packages_by_path_context[context] += 1
+
+    config_issues_by_rule = {}
+    for f in findings:
+        if f["category"] == "config":
+            label = f["summary"]
+            config_issues_by_rule[label] = config_issues_by_rule.get(label, 0) + 1
 
     commit = git_head(root)
     doc = {
@@ -1234,7 +1255,9 @@ def main(argv):
             "osv_enabled": use_osv,
             "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
+            "secret_hits_by_rule": dict(sorted(secret_hits_by_rule.items())),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
+            "config_issues_by_rule": dict(sorted(config_issues_by_rule.items())),
             "by_severity": by_sev,
             "highest_severity": findings[0]["severity"] if findings else None,
             "highest_severity_by_file": dict(sorted(highest_severity_by_file.items())),

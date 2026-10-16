@@ -43,7 +43,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.13
+- uses: project-feldspar-resources/feldspar-scan@v0.4.14
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.13`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.14`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -102,8 +102,10 @@ Server source: `web/server.py` in this repo (stdlib-only; the same process serve
 hosted form, the JSON API and `/mcp`, so you can self-host all three with `python3 web/server.py`).
 
 Exit codes: `0` ok, `1` gate tripped (`--fail-on`), `2` bad args / bad path,
-`3` clone failed. Without `--fail-on`, a non-zero finding count does **not**
-change the exit code. An exit code of `0` means no severity gate fired; it
+`3` clone failed. Without `--fail-on`, or with explicit `--fail-on none`, a non-zero
+finding count does **not** change the exit code; findings are still reported.
+`none` disables only the severity gate, not argument, path, or clone errors.
+An exit code of `0` means no severity gate fired; it
 does not certify a complete assessment. Review `errors`, `summary.notes`,
 `summary.lockfiles_parsed`, and `summary.packages_found` in the report.
 `--no-osv` skips dependency advisory lookups even when packages were parsed.
@@ -234,6 +236,23 @@ every advisory in the finding. Empty, offline, and no-fix reports return zero;
 zero does not certify coverage or prove no fix exists. Finding limits can omit
 dependencies from this count. The field does not affect gates or `manifest_hash`.
 
+`summary.secret_hits_by_rule` groups emitted secret findings by their existing
+human-readable `summary` labels, in alphabetical label order. Its counts sum to
+`summary.secret_hits`; no secret findings produces `{}`. Repeated hits count
+separately, including when provider and generic rules both match one value.
+Low-severity hinted hits are included, and `--triage` does not change the counts.
+These labels are not stable rule IDs or credential validation; no matched values
+are included. Scan limits restrict the counts to emitted findings. This field
+does not affect `manifest_hash` or the severity gate.
+
+`summary.config_issues_by_rule` groups emitted configuration findings by their
+existing human-readable `summary` labels, in alphabetical order. These labels
+are not stable rule IDs. Counts sum to `summary.config_issues`; no configuration
+findings produces `{}`. Multiple findings in one file count separately, while
+checks that emit once per file still count once. File and finding limits can
+omit results, so these counts do not certify configuration coverage. They contain
+no credential values and do not affect findings, severity gates or `manifest_hash`.
+
 `summary.highest_severity` is the highest severity in the emitted findings,
 ordered `critical`, `high`, `medium`, `low`, then `unknown`. It is `unknown` when
 all findings are unrated and JSON `null` when no findings were emitted. It uses
@@ -281,6 +300,10 @@ and `manifest_hash` stay untouched:
 - `triage_summary` — counts and a one-line `headline`: dependency advisories split
   into `upgradeable` (a patched release exists) vs `monitor_only` (no patch yet),
   and secret hits split into `needs_review` vs `likely_false_positive`.
+  `secret_review_by_severity` breaks down the secret hits needing review by
+  raw severity (`critical`, `high`, `medium`, `low`, `unknown`, including zeros).
+  It excludes likely false positives and counts only emitted findings if the
+  scan was truncated; these counts do not alter the raw severity gate.
   `config.needs_review` counts configuration findings and includes them in the
   headline, including when no secrets or dependency findings exist. Like other
   triage counts, it covers only emitted findings when scan limits truncate results.
@@ -375,6 +398,17 @@ Such files still count in `summary.files_scanned`; skipping them does not set
 `summary.truncated`. Secrets found only in excluded files cannot trigger the
 severity gate, so a passing gate does not establish that those files are clear.
 
+The secret-scan lockfile exclusion uses these exact basenames, at any depth:
+`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `poetry.lock`, `uv.lock`,
+`Cargo.lock`, `Gemfile.lock`, `go.sum`, `go.mod`, and `composer.lock`.
+It includes the `go.mod` manifest and `composer.lock` even though Composer
+dependency parsing is unsupported. It is not a blanket `.lock` exclusion:
+`custom.lock` and other manifests such as `requirements.txt`, `package.json`,
+and `pyproject.toml` still receive secret scanning when otherwise eligible.
+Supported dependency inventory/lookups run independently of this secret-scan
+exclusion. A parsed lockfile with no secret findings does not establish that
+its contents were checked for secrets.
+
 | Pattern | Severity |
 | --- | --- |
 | `AKIA[0-9A-Z]{16}` (AWS access key id) | high |
@@ -427,23 +461,31 @@ The generic assignment rule is downgraded to **low** and the evidence is tagged
 
 **Value-shape hints (v0.4.1).** The 2026-10-08 dataset showed that most secret hits
 surviving the path rule were not credentials at all, so the evidence now carries one
-of these tags and the raw severity drops to **low** when the *value* has a
-non-credential shape; `--triage` classifies the same tags as likely false positives:
+of these tags and the raw severity drops to **low** when the *value* matches a
+shape heuristic; `--triage` classifies the same tags as likely false positives:
 
 | tag | shape |
 | --- | --- |
 | `(expression?)` | template / env reference: `={{$credentials.x}}`, `${VAR}`, `$VAR`, `$__env{…}`, `{env:…}`, `#{…}`, `%{…}`, `<%…`, `var(--…)` |
-| `(non-ascii?)` | contains non-ASCII text (translated UI copy, `••••` masks) — credentials are ASCII |
+| `(non-ascii?)` | generic assignment value contains non-ASCII text (often translated UI copy or `••••` masks); a real password can also match |
 | `(dotted-name?)` | dotted identifier with no digits (`entity.other.inherited-class`, `grafana.someFlagToken`, hostnames) |
-| `(word-like?)` | letters, underscores and hyphens only, no digits (`ATTR_TOKEN = "long_lived_access_token"`, API field names, header names) — random credentials carry digits |
+| `(word-like?)` | generic assignment value starts with an ASCII letter and contains only ASCII letters, underscores and hyphens, with no digits; includes mixed-case values, not just words or field names |
 | `(form-placeholder?)` | the match sits inside a form `placeholder=` attribute |
 | `(example-key?)` | fixed-pattern hit that is a documented example (`AKIAIOSFODNN7EXAMPLE`, GitHub's docs `ghp_…`) or an `xxxx…`/`0000…`/`****` masked value |
 
-Hints never delete a finding: the hit stays in `findings` with its tag, and a value
-that looks like a live credential (digits, mixed case, a bcrypt `$2b$…` hash, a JWT)
-keeps its original severity and routes to `review`. The known cost of `word-like?`
-is a digit-less dictionary password (`"correcthorsebatterystaple"`) being tagged low;
-it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mocks__`,
+Hints do not suppress matches: retained hits stay in `findings` with their tags,
+subject to the finding limits described above. They are
+prioritization heuristics, not credential validation. A real password can contain
+non-ASCII characters or no digits. Even a mixed-case value such as
+`"AbCdEfGhJkLmNpQrStUv"` matches `word-like?`; matching generic assignments are
+still reported at low severity and classified likely false positives by `--triage`.
+Such hits alone do not trip `--fail-on medium` (or a higher threshold), but do trip
+`--fail-on low`. Generic assignments without a hint keep medium severity; path
+heuristics may still classify them as likely false positives during triage.
+Provider-token hits (excluding private-key handling) use example/mask and form-placeholder hints,
+not the generic `word-like?` or `non-ascii?` checks: a matching GitHub token with
+an all-letter payload can still be high severity. No hint establishes whether
+a credential is live. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mocks__`,
 `testutils/`, `test-utils/`, `snapshots/`, `testUtils.*`.
 
 ### 3. `config`
@@ -456,6 +498,20 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
   `--fail-on`. Template filenames do not certify that their contents are safe.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
 * `Dockerfile` with `ADD http(s)://…` — low.
+* `Dockerfile` (or `Dockerfile.*`) whose final stage's last explicit `USER`
+  is `root` or `0`, optionally with a group suffix — low. Earlier stages and
+  overridden users do not trigger this check; inherited users and variables
+  are not resolved.
+* `Dockerfile` base images with no tag or with `:latest` — low. Non-latest tagged images,
+  full SHA-256 digest references, `scratch`, earlier stage aliases and image
+  references containing `$` are excluded. A tag is not a guarantee of immutability.
+* `Dockerfile` `ENV` / `ARG` assignments to secret-like variable names — high.
+  Names such as `API_TOKEN` and `DB_PASSWORD` match; empty values, bare `ARG`
+  declarations and whole-value `$VAR` / `${VAR}` references are excluded.
+  This is a name/value heuristic, not validation of a credential.
+* Shell-form `Dockerfile` `RUN` with `curl` directly piped to `sh` or `bash` —
+  medium. JSON exec-form instructions and indirect shell execution are not
+  analyzed. This flags the command shape without fetching or running anything.
 * `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` containing a plain
   `privileged: true` declaration — medium. The key may be unquoted or enclosed in
   matching single or double quotes; the value must remain plain `true`.
@@ -488,6 +544,24 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
 
 All config checks listed above are implemented.
 
+For example, scanning this synthetic Dockerfile emits five config findings:
+one low finding each for the base image and root user, one high finding each
+for `ENV` and `ARG`, and one medium finding for the pipe. Assignment values and
+the URL are omitted from their evidence. The scanner reads this as text; it
+does not build the image or execute the commands.
+
+```dockerfile
+FROM alpine:latest
+USER root
+ENV API_TOKEN=synthetic-value
+ARG DB_PASSWORD=synthetic-value
+RUN curl https://example.invalid/install | sh
+```
+
+Dockerfile checks use a bounded instruction/shell heuristic, not a full Docker
+parser or image inspection. Comments and supported heredoc bodies are ignored;
+base-image metadata, variable expansion and runtime overrides are not resolved.
+
 ## Limits
 
 * **Deterministic only.** Pure regex/parser matching plus OSV lookups. No LLM,
@@ -512,6 +586,13 @@ All config checks listed above are implemented.
   trigger `--fail-on`; an ignored local file is not evidence that it was committed.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
+  Requirements environment markers after `;` are discarded without evaluation:
+  `demo==1.0; python_version < "0"` still contributes `demo` version `1.0` to
+  inventory and, when enabled, advisory queries. Extras are stripped from names
+  (`demo[fast]==1.0` becomes `demo==1.0`); they do not trigger extra dependency
+  resolution. Duplicate package/version pins count once, while distinct pinned
+  versions remain even under mutually exclusive markers. This is a static
+  inventory, not the resolved installation for the current interpreter or platform.
 * Go: `go.mod`'s `require` set (direct + indirect) is the build list and is what
   gets queried; `go.sum` is only read when no `go.mod` sits beside it, because it
   also records superseded module versions (v0.4 — the 2026-10-08 dataset showed
