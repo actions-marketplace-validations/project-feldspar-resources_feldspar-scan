@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.12"
+VERSION = "0.4.13"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -589,7 +589,7 @@ SECRET_PATTERNS = [
      "high", "GitLab personal access token"),
     ("npm-token", re.compile(r"(?<!\w)npm_[A-Za-z0-9]{36}(?!\w)"),
      "high", "npm access token"),
-    ("openai-api-key", re.compile(r"(?<![A-Za-z0-9_-])sk-(?:proj-[A-Za-z0-9_-]{40,}|(?!proj-|ant-)[A-Za-z0-9_-]{40,})(?![A-Za-z0-9_-])"),
+    ("openai-api-key", re.compile(r"(?<![\w-])sk-(?:proj-[A-Za-z0-9_-]{40,}|(?!proj-|ant-)[A-Za-z0-9_-]{40,})(?![\w-])"),
      "high", "OpenAI API key"),
     ("anthropic-api-key", re.compile(r"(?<![\w-])sk-ant-[A-Za-z0-9_-]{40,}(?![\w-])"),
      "high", "Anthropic API key"),
@@ -597,11 +597,11 @@ SECRET_PATTERNS = [
      "medium", "Hugging Face token"),
     ("sendgrid-api-key", re.compile(r"(?<![\w-])SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![\w-])"),
      "high", "SendGrid API key"),
-    ("telegram-bot-token", re.compile(r"(?<![A-Za-z0-9_-])[0-9]+:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])"),
+    ("telegram-bot-token", re.compile(r"(?<![\w-])[0-9]+:[A-Za-z0-9_-]{35}(?![\w-])"),
      "high", "Telegram bot token"),
     ("twilio-api-key-sid", re.compile(r"(?<!\w)SK[0-9a-fA-F]{32}(?!\w)"),
      "medium", "Twilio API key SID"),
-    ("slack-token", re.compile(r"(?<![0-9A-Za-z_-])xox[baprs]-[0-9A-Za-z-]{10,}(?![0-9A-Za-z_-])"),
+    ("slack-token", re.compile(r"(?<![\w-])xox[baprs]-[0-9A-Za-z-]{10,}(?![\w-])"),
      "high", "Slack token"),
     ("stripe-live-key", re.compile(r"(?<!\w)sk_live_[0-9a-zA-Z]{24,}(?!\w)"),
      "critical", "Stripe live secret key"),
@@ -1202,6 +1202,11 @@ def main(argv):
     for manifest in pkgs.values():
         packages_by_manifest[manifest] += 1
 
+    packages_by_path_context = {"scaffold": 0, "other": 0}
+    for manifest in pkgs.values():
+        context = "scaffold" if TEST_PATH_RE.search(manifest) else "other"
+        packages_by_path_context[context] += 1
+
     commit = git_head(root)
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
@@ -1217,8 +1222,11 @@ def main(argv):
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
             "packages_by_ecosystem": packages_by_ecosystem,
+            "packages_by_path_context": packages_by_path_context,
             "packages_by_manifest": packages_by_manifest,
             "vulnerable_packages": len(vulnerable),
+            "dependency_findings_with_fixes": sum(
+                1 for f in findings if f["category"] == "dependency-vuln" and f["fixed_in"]),
             "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"

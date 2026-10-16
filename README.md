@@ -43,7 +43,7 @@ without scanning a target, contacting the network, or writing a report.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.12
+- uses: project-feldspar-resources/feldspar-scan@v0.4.13
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -61,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.12`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.13`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -168,9 +168,24 @@ counts. An empty object means no manifest was parsed. These inventory counts
 are available with `--no-osv`, are bounded by file limits, and are unaffected by
 finding limits or advisory results. They do not change `manifest_hash`.
 
+`summary.packages_by_path_context` splits the same unique inventory entries into
+`scaffold` and `other`, including zero counts. Classification uses the existing
+test/example/fixture/documentation/CI path heuristic on each entry's attributed
+manifest; an entry seen in both contexts is attributed to the non-scaffold path.
+Distinct versions and ecosystems count separately. The counts sum to
+`packages_found` and are available with `--no-osv` and without `--triage`.
+This is a path hint, not proof of deployment or runtime use: a development
+dependency outside a recognized scaffold path counts as `other`. File limits
+bound the inventory; finding limits do not. Findings and `manifest_hash` are
+unchanged by this summary.
+
 `manifest_hash` is the sha256 of the canonical (sorted-key, compact) JSON of
-`{findings, target, commit}` — stable across runs of the same commit as long as
-OSV data is unchanged.
+`{findings, target, commit}`. It is stable when those three values are unchanged;
+it is a report fingerprint, not a checksum of all repository contents. Findings
+reflect the current working tree, so uncommitted edits can change the hash even
+with the same commit and OSV data. Edits that leave findings unchanged do not
+change it when target and commit are unchanged. `target` preserves the literal
+CLI argument: different spellings of the same path can produce different hashes.
 
 Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
@@ -210,6 +225,14 @@ findings. Each row sums to its `summary.by_category` count, and each severity
 column sums to its `summary.by_severity` count. These are raw severities, unchanged
 by `--triage`, and count only emitted findings when limits truncate the report.
 This summary does not affect `manifest_hash` or the `--fail-on` exit gate.
+
+`summary.dependency_findings_with_fixes` counts emitted dependency findings with
+at least one reported `fixed_in` version. Each package/version finding counts
+once, even with multiple advisories or fixed versions. This counts reported fix
+metadata, not verified upgrade recommendations: a listed version need not fix
+every advisory in the finding. Empty, offline, and no-fix reports return zero;
+zero does not certify coverage or prove no fix exists. Finding limits can omit
+dependencies from this count. The field does not affect gates or `manifest_hash`.
 
 `summary.highest_severity` is the highest severity in the emitted findings,
 ordered `critical`, `high`, `medium`, `low`, then `unknown`. It is `unknown` when
@@ -309,6 +332,12 @@ else a numeric CVSS score from the `severity` list mapped ≥9 critical, ≥7 hi
 ≥4 medium, else low; `unknown` when neither is available. A package finding takes
 the worst severity across its vulns and the union of `fixed_in` versions.
 
+CVSS vector strings are not evaluated. An advisory with only vector strings and
+no recognized `database_specific.severity` remains `unknown`. Packages with such
+advisories can still produce dependency findings, subject to finding limits;
+other rated advisories can raise a package finding's severity. `unknown` findings do not trigger `--fail-on`,
+even at `low`. A passing severity gate therefore does not clear unrated advisories.
+
 HTTP timeout is 20 s per call. Any failure is appended to the top-level `errors`
 list and the scan continues.
 
@@ -331,6 +360,20 @@ file are still checked. The separate multiline private-key block check is not
 subject to this per-line limit; the file-size and file-selection limits above
 still apply. A report with no secret findings does not establish that skipped
 lines are free of secrets.
+
+The 1 MiB limit is 1,048,576 file bytes, not decoded characters. A file exactly
+at the limit can be scanned; larger files are skipped entirely, including any
+secret on the first line. Other eligible files are still scanned. An oversized
+file can still count in `summary.files_scanned`; skipping its text does not set
+`summary.truncated`, whose flags describe file-count and finding-count caps.
+An empty findings list with both flags false therefore does not establish that
+all file contents were checked.
+
+Extension exclusions apply before reading the content and are case-insensitive:
+even readable text in `.svg` / `.SVG` files is omitted from secret scanning.
+Such files still count in `summary.files_scanned`; skipping them does not set
+`summary.truncated`. Secrets found only in excluded files cannot trigger the
+severity gate, so a passing gate does not establish that those files are clear.
 
 | Pattern | Severity |
 | --- | --- |
@@ -405,7 +448,12 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
 
 ### 3. `config`
 
-* `.env` / `.env.*` committed with at least one `KEY=value` line — high.
+* `.env` / `.env.*` with at least one assignment (`KEY=value`, optionally prefixed
+  by `export`) — high. Filenames ending exactly in lowercase `.example`, `.sample`,
+  `.template`, or `.dist` are exempt from this configuration check. This exemption
+  does not suppress secret-pattern scanning: a credential-shaped value in an
+  otherwise eligible template file can still produce a secret finding and trip
+  `--fail-on`. Template filenames do not certify that their contents are safe.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
 * `Dockerfile` with `ADD http(s)://…` — low.
 * `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` containing a plain
@@ -458,6 +506,10 @@ All config checks listed above are implemented.
 * **No git history scan.** Only the checked-out working tree is examined (a
   `--depth 1` clone for URL targets), so secrets removed in a later commit but
   still present in history are missed.
+* **Local scans do not honor `.gitignore` or restrict files to Git's index.**
+  Untracked and ignored regular files are scanned too, subject to the scanner's
+  directory/file exclusions and size/count limits. Findings in those files can
+  trigger `--fail-on`; an ignored local file is not evidence that it was committed.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
 * Go: `go.mod`'s `require` set (direct + indirect) is the build list and is what
