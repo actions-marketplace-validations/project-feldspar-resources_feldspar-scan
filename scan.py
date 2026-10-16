@@ -2,8 +2,11 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage] [--compact]
+               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty] [--sort-keys]
        scan.py --version
+
+For local directories named -h, --help, or --version, use an explicit path:
+./-h, ./--help, or ./--version (for example: scan.py ./--help --no-osv).
 
   --version       print scanner name and version, then exit (standalone invocation).
 
@@ -11,6 +14,8 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
   --json PATH     write JSON to PATH; use - for stdout (also the default).
                   Also accepts --json=PATH; PATH must be non-empty.
   --compact       write JSON on one line, to stdout or --json PATH.
+  --pretty        write indented JSON (the default); last formatting flag wins.
+  --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
@@ -26,6 +31,7 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                   manifest_hash are unchanged; triage is a separate, additive section.
                   v0.4: dependency hits from lockfiles under test/fixture/example/benchmark
                   paths are tagged scaffold (low priority).
+  --no-triage     omit the interpretation layer (the default); last triage flag wins.
 
 Exit codes: 0 no severity gate fired; 1 gate fired (--fail-on);
             2 bad args / bad path; 3 clone failed.
@@ -66,7 +72,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.16"
+VERSION = "0.4.17"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -358,7 +364,7 @@ def parse_go_mod(text):
         m = None
         if in_req:
             m = re.match(r"^(\S+)\s+(v\S+)$", s)
-        elif s.startswith("require "):
+        else:
             m = re.match(r"^require\s+(\S+)\s+(v\S+)$", s)
         if m:
             out.append(("Go", m.group(1), m.group(2)))
@@ -1103,7 +1109,7 @@ def main(argv):
         return 0
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
-    compact = False
+    compact = sort_keys = False
     i = 1
     while i < len(args):
         if args[i].startswith("--fail-on="):
@@ -1126,8 +1132,17 @@ def main(argv):
         elif args[i] == "--triage":
             triage = True
             i += 1
+        elif args[i] == "--no-triage":
+            triage = False
+            i += 1
         elif args[i] == "--compact":
             compact = True
+            i += 1
+        elif args[i] == "--pretty":
+            compact = False
+            i += 1
+        elif args[i] == "--sort-keys":
+            sort_keys = True
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
@@ -1217,11 +1232,15 @@ def main(argv):
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
+    dependency_findings_by_ecosystem = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         files_by_sev.setdefault(f["severity"], set()).add(f["file"])
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
+        if f["category"] == "dependency-vuln":
+            ecosystem = f["ecosystem"]
+            dependency_findings_by_ecosystem[ecosystem] = dependency_findings_by_ecosystem.get(ecosystem, 0) + 1
         if f["category"] == "secret":
             label = f["summary"]
             secret_hits_by_rule[label] = secret_hits_by_rule.get(label, 0) + 1
@@ -1268,6 +1287,7 @@ def main(argv):
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
+            "total_findings": len(findings),
             "files_scanned": len(files),
             "files_with_findings": len({f["file"] for f in findings}),
             "findings_by_file": dict(sorted(findings_per_file.items())),
@@ -1283,7 +1303,10 @@ def main(argv):
             "vulnerable_packages": len(vulnerable),
             "dependency_findings_with_fixes": sum(
                 1 for f in findings if f["category"] == "dependency-vuln" and f["fixed_in"]),
+            "dependency_findings_without_fixes": sum(
+                1 for f in findings if f["category"] == "dependency-vuln" and not f["fixed_in"]),
             "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
+            "dependency_findings_by_ecosystem": dict(sorted(dependency_findings_by_ecosystem.items())),
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"
                                       for vid in f["vuln_ids"]}),
@@ -1297,6 +1320,8 @@ def main(argv):
                 rule: len(paths) for rule, paths in sorted(secret_files_by_rule.items())
             },
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
+            "config_lines": len({(f["file"], f["line"]) for f in findings
+                                 if f["category"] == "config" and f["line"] is not None}),
             "config_files_by_rule": {
                 rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
             },
@@ -1342,7 +1367,8 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    text = json.dumps(doc, separators=(",", ":")) if compact else json.dumps(doc, indent=2)
+    text = (json.dumps(doc, separators=(",", ":"), sort_keys=sort_keys) if compact
+            else json.dumps(doc, indent=2, sort_keys=sort_keys))
     if out_path and out_path != "-":
         with open(out_path, "w") as fh:
             fh.write(text + "\n")

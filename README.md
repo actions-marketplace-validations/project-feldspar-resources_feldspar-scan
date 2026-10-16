@@ -26,6 +26,12 @@ python3 scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] 
 (see *Triage* under Output shape). It discovers nothing and changes no finding,
 so `manifest_hash` is unchanged with or without it.
 
+Use `--no-triage` to explicitly omit the interpretation layer (the default).
+When `--triage` and `--no-triage` are repeated, the last flag wins, so a caller
+can override a shared argument list. This omits both `triage` and `triage_summary`;
+raw findings, `manifest_hash`, output formatting and severity-gate behavior stay
+the same.
+
 JSON is printed to stdout by default. Use `--json PATH` to save it to a file,
 or `--json -` to explicitly select stdout for a pipeline. Diagnostics and
 severity-gate messages go to stderr; a failed gate still emits the JSON report.
@@ -36,18 +42,31 @@ The equivalent inline form `--json=PATH` accepts a non-empty path, including
 An empty `--json=` is an argument error (exit 2) before scanning or cloning.
 
 Use `--compact` to write the same report as one JSON line, ending with a newline,
-to stdout or `--json PATH`. The default remains indented JSON. This changes only
+to stdout or `--json PATH`. Use `--pretty` to explicitly select the default
+two-space indented JSON; the last `--compact` or `--pretty` flag wins. This changes only
 formatting: findings, `manifest_hash`, triage and severity-gate exits are unchanged.
+
+Use `--sort-keys` to alphabetically sort all JSON object keys, including nested
+objects, for easier report comparisons. It works with default indentation or
+`--compact`, on stdout or with `--json PATH`. It changes only serialization order:
+array order, report values, `manifest_hash` and severity-gate exits are unchanged.
+Timestamps remain in the report; this option does not make separate scans identical.
+Without this flag, the existing object-key order is preserved.
 
 Run `python3 scan.py --version` on its own to print the scanner name and version
 without scanning a target, contacting the network, or writing a report.
+
+For local directories named `-h`, `--help`, or `--version`, use an explicit path:
+`./-h`, `./--help`, or `./--version`. For example, `python3 scan.py ./--help --no-osv`
+scans the local `--help` directory offline. Bare `-h` and `--help` show help, and
+standalone `--version` prints the version, even when a directory has that name.
 
 **2. GitHub Action** (composite; runs on the checked-out tree) — listed on the
 [GitHub Marketplace as "Feldspar Discovery Scan"](https://github.com/marketplace/actions/feldspar-discovery-scan):
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.16
+- uses: project-feldspar-resources/feldspar-scan@v0.4.17
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -65,7 +84,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.16`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.17`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -148,6 +167,17 @@ oversized files still count, and secret scanning skips lockfiles and common
 binary/image extensions. Excluded directories and symlinks do not count. When
 `summary.truncated.files` is true, additional candidate files were omitted.
 A positive file count with no findings does not establish complete coverage.
+
+`summary.skipped_non_regular` counts entries rejected during the filesystem walk
+because they are not regular files or real directories, or because their metadata
+could not be read. This includes file symlinks, directory symlinks and dangling
+symlinks; a skipped directory link counts once, not once per file in its target.
+Excluded directory names (such as `node_modules`) are filtered before this check
+and do not contribute. Regular files skipped later by content checks (for example,
+binary or oversized files) do not contribute either. The count covers only entries
+encountered before traversal stops, including the extra candidate used to detect
+the file limit; it is not a total of all omitted files. Zero does not establish
+complete coverage. Skips alone do not trip the severity gate.
 
 `summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
 lookups, and `true` otherwise. It records the selected mode, not lookup success:
@@ -246,6 +276,16 @@ column sums to its `summary.by_severity` count. These are raw severities, unchan
 by `--triage`, and count only emitted findings when limits truncate the report.
 This summary does not affect `manifest_hash` or the `--fail-on` exit gate.
 
+`summary.dependency_findings_by_ecosystem` counts emitted dependency findings by
+ecosystem, in sorted ecosystem order. Only ecosystems with retained findings
+appear; the counts sum to `summary.by_category["dependency-vuln"]`. Multiple
+advisory IDs on one finding count once. Counts reflect both finding caps, whereas
+`summary.vulnerable_packages_by_ecosystem` counts affected inventory entries even
+when their findings are omitted. No emitted dependency findings yields `{}`;
+this does not certify coverage (review OSV status, errors and truncation). Triage
+and severity gates do not filter these counts. This field does not affect
+`manifest_hash`.
+
 `summary.dependency_findings_with_fixes` counts emitted dependency findings with
 at least one reported `fixed_in` version. Each package/version finding counts
 once, even with multiple advisories or fixed versions. This counts reported fix
@@ -253,6 +293,15 @@ metadata, not verified upgrade recommendations: a listed version need not fix
 every advisory in the finding. Empty, offline, and no-fix reports return zero;
 zero does not certify coverage or prove no fix exists. Finding limits can omit
 dependencies from this count. The field does not affect gates or `manifest_hash`.
+
+`summary.dependency_findings_without_fixes` counts emitted dependency findings
+whose `fixed_in` list is empty. It counts findings, not advisory IDs; a finding
+with any reported fix is excluded even if its other advisories have no fix
+metadata. Together with `dependency_findings_with_fixes`, it sums to
+`summary.by_category["dependency-vuln"]`. Missing fix metadata does not prove that
+no fixed release exists. Empty, offline, and no-advisory reports return zero;
+finding limits can omit results. This count is unchanged by `--triage` and does
+not affect findings, severity gates or `manifest_hash`.
 
 `summary.secret_hits_by_rule` groups emitted secret findings by their existing
 human-readable `summary` labels, in alphabetical label order. Its counts sum to
@@ -296,6 +345,13 @@ and does not affect `manifest_hash`. Passing describes the exit-code gate,
 not complete coverage: review errors, notes and truncation flags, since discarded
 findings cannot contribute to the count.
 
+`summary.total_findings` counts emitted findings across all categories and
+severities, including `unknown`, after file and finding caps. It equals the
+length of `findings` and is zero for an empty report. `--triage` and `--fail-on`
+do not filter this count; findings below the gate threshold still contribute.
+Zero does not prove a complete scan: review errors, notes and truncation flags.
+This summary field does not affect `manifest_hash`.
+
 `summary.limits` records the applied caps: `files` (candidate files visited),
 `findings` (total findings emitted), and `findings_per_file` (findings emitted
 per file across all categories). These are limits, not observed counts; consult
@@ -324,6 +380,12 @@ reported header line. This is a source-location count, not a count of distinct
 credentials; zero means no emitted secret findings, not complete coverage.
 Finding limits can omit locations. The count includes low-severity hints and is
 unchanged by `--triage`; it does not affect findings, gates or `manifest_hash`.
+
+`summary.config_lines` counts distinct `(file, line)` locations in emitted
+configuration findings with a line number. Multiple rules on one line count once;
+the same line number in different files counts separately. File-wide findings
+with a null line (such as a missing Dockerfile USER) are excluded. This counts
+only retained findings after scan limits, not every configuration line scanned.
 
 `summary.config_files_by_rule` maps configuration finding summary labels to
 distinct affected-file counts, in alphabetical label order. Repeated warnings
@@ -418,7 +480,14 @@ Manifests/lockfiles parsed (files under `node_modules/`, `vendor/`, `.git/`,
 | `pnpm-lock.yaml` | npm | `packages:` keys `/name@1.2.3` or `name@1.2.3` |
 | `go.mod` | Go | the `require` build list (direct + `// indirect`); preferred over `go.sum` (v0.4) |
 | `go.sum` | Go | only when no `go.mod` sits beside it (go.sum also lists superseded versions); `/go.mod` suffix stripped |
-| `Gemfile.lock` | RubyGems | `specs:` section, `    name (1.2.3)` |
+| `Gemfile.lock` | RubyGems | `specs:` within `GEM` sections only, `    name (1.2.3)`; `GIT`/`PATH` specs excluded |
+
+For `Gemfile.lock`, only gems listed in `GEM` sections enter the package inventory
+and RubyGems advisory lookup. Gems listed under `GIT` or `PATH` are excluded,
+even if their names and versions resemble registry gems. A lockfile containing
+only those excluded sources can still appear in `summary.lockfiles_parsed`
+while contributing zero packages and causing no advisory requests. A clean
+report therefore does not assess the excluded Git or local-path dependencies.
 
 Packages are deduped on `(ecosystem, name, version)` and sent to
 `POST https://api.osv.dev/v1/querybatch` in chunks of 500. Each returned vuln id
