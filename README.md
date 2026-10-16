@@ -3,7 +3,9 @@
 A small, deterministic, dependency-free repository scanner: **dependency advisories
 from [OSV.dev](https://osv.dev/), leaked-secret patterns, and a handful of config
 checks.** One Python 3.11+ file, standard library only. No LLM, no account, no
-telemetry, no network calls other than OSV.dev (and none at all with `--no-osv`).
+telemetry. A local-path scan contacts only OSV.dev for dependency lookups;
+`--no-osv` makes that local scan offline. Scanning a Git URL also clones
+the repository over the network, including with `--no-osv`.
 
 It is the free, open tier of [Project Feldspar](https://project-feldspar.com/), a
 codebase-audit service built and operated by Feldspar, an autonomous AI agent.
@@ -24,12 +26,24 @@ python3 scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv] 
 (see *Triage* under Output shape). It discovers nothing and changes no finding,
 so `manifest_hash` is unchanged with or without it.
 
+JSON is printed to stdout by default. Use `--json PATH` to save it to a file,
+or `--json -` to explicitly select stdout for a pipeline. Diagnostics and
+severity-gate messages go to stderr; a failed gate still emits the JSON report.
+To write a literal file named `-`, use `--json ./-`.
+
+Use `--compact` to write the same report as one JSON line, ending with a newline,
+to stdout or `--json PATH`. The default remains indented JSON. This changes only
+formatting: findings, `manifest_hash`, triage and severity-gate exits are unchanged.
+
+Run `python3 scan.py --version` on its own to print the scanner name and version
+without scanning a target, contacting the network, or writing a report.
+
 **2. GitHub Action** (composite; runs on the checked-out tree) — listed on the
 [GitHub Marketplace as "Feldspar Discovery Scan"](https://github.com/marketplace/actions/feldspar-discovery-scan):
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.2
+- uses: project-feldspar-resources/feldspar-scan@v0.4.13
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -47,7 +61,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.2`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.13`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -89,7 +103,10 @@ hosted form, the JSON API and `/mcp`, so you can self-host all three with `pytho
 
 Exit codes: `0` ok, `1` gate tripped (`--fail-on`), `2` bad args / bad path,
 `3` clone failed. Without `--fail-on`, a non-zero finding count does **not**
-change the exit code.
+change the exit code. An exit code of `0` means no severity gate fired; it
+does not certify a complete assessment. Review `errors`, `summary.notes`,
+`summary.lockfiles_parsed`, and `summary.packages_found` in the report.
+`--no-osv` skips dependency advisory lookups even when packages were parsed.
 
 ## Self-test
 
@@ -107,14 +124,154 @@ committed `.env`. All three detectors should fire.
 Top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
 
+`summary.errors_count` counts entries in the top-level `errors` list, or is zero
+when that list is absent. It counts recorded errors, not affected packages or
+failed requests. Zero does not certify complete coverage; review the notes,
+truncation flags and OSV mode as well. Error reporting does not change findings,
+`manifest_hash`, or the severity gate's exit code.
+
+`summary.files_scanned` counts regular-file paths selected after directory and
+symlink exclusions, up to the file limit. It does not count successful content
+reads or certify that every selected file received every check: binary and
+oversized files still count, and secret scanning skips lockfiles and common
+binary/image extensions. Excluded directories and symlinks do not count. When
+`summary.truncated.files` is true, additional candidate files were omitted.
+A positive file count with no findings does not establish complete coverage.
+
+`summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
+lookups, and `true` otherwise. It records the selected mode, not lookup success:
+check `errors`, `summary.packages_found`, and `summary.lockfiles_parsed` for
+coverage. Zero vulnerable packages with OSV disabled does not mean dependencies
+were checked. This summary field does not affect `manifest_hash`.
+
+`summary.packages_by_ecosystem` counts unique `(ecosystem, name, version)` inventory
+entries for each observed ecosystem, in sorted ecosystem order. Its counts sum to
+`summary.packages_found`; duplicate entries across manifests count once, while
+different versions count separately. Empty inventory produces `{}`. These are
+inventory counts, including with `--no-osv`, not advisory counts or proof of a
+complete assessment. File limits bound this inventory; finding limits do not.
+
+`summary.vulnerable_packages_by_ecosystem` counts unique vulnerable
+`(ecosystem, name, version)` entries returned by OSV, grouped in sorted ecosystem
+order. Only affected ecosystems appear, and the counts sum to
+`summary.vulnerable_packages`, even when finding limits truncate the report.
+Multiple advisories for one package version count once; distinct versions count
+separately. No returned vulnerabilities or `--no-osv` produces `{}`. These counts
+do not establish lookup completeness or change findings, gates, or `manifest_hash`.
+
+`summary.packages_by_manifest` counts deduplicated inventory entries attributed to
+each parsed manifest, in sorted path order, including zero counts. Each unique
+`(ecosystem, name, version)` is attributed to one file: the first encountered,
+with a shipped manifest preferred over a test/fixture/example manifest. These
+counts sum to `summary.packages_found`; they are not raw per-file dependency
+counts. An empty object means no manifest was parsed. These inventory counts
+are available with `--no-osv`, are bounded by file limits, and are unaffected by
+finding limits or advisory results. They do not change `manifest_hash`.
+
+`summary.packages_by_path_context` splits the same unique inventory entries into
+`scaffold` and `other`, including zero counts. Classification uses the existing
+test/example/fixture/documentation/CI path heuristic on each entry's attributed
+manifest; an entry seen in both contexts is attributed to the non-scaffold path.
+Distinct versions and ecosystems count separately. The counts sum to
+`packages_found` and are available with `--no-osv` and without `--triage`.
+This is a path hint, not proof of deployment or runtime use: a development
+dependency outside a recognized scaffold path counts as `other`. File limits
+bound the inventory; finding limits do not. Findings and `manifest_hash` are
+unchanged by this summary.
+
 `manifest_hash` is the sha256 of the canonical (sorted-key, compact) JSON of
-`{findings, target, commit}` — stable across runs of the same commit as long as
-OSV data is unchanged.
+`{findings, target, commit}`. It is stable when those three values are unchanged;
+it is a report fingerprint, not a checksum of all repository contents. Findings
+reflect the current working tree, so uncommitted edits can change the hash even
+with the same commit and OSV data. Edits that leave findings unchanged do not
+change it when target and commit are unchanged. `target` preserves the literal
+CLI argument: different spellings of the same path can produce different hashes.
 
 Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
 Findings are sorted by severity, then category/file/line, and `id` is assigned
 after sorting (`F-001`…).
+
+`summary.files_with_findings` counts distinct relative file paths in the emitted
+`findings` list, including all categories and severities. Multiple findings in one
+file count once. With scan limits reached, this counts only the files represented
+in the truncated report; it does not estimate affected files omitted by the limits.
+
+`summary.findings_by_file` maps relative file paths to emitted finding counts,
+with paths sorted lexically. It includes all categories and severities, omits
+files with no findings, and is `{}` for an empty report. Counts sum to the length
+of `findings`; a dependency finding with multiple advisories counts once. Scan
+limits restrict these counts to retained findings, and the mapping does not
+change with `--triage` or affect `manifest_hash`.
+
+`summary.files_with_findings_by_category` counts distinct relative file paths for
+each of `dependency-vuln`, `secret`, and `config`, including zero counts. Repeated
+findings in one file count once within each category; a file with both secret and
+config findings counts in both categories. These counts can therefore sum to more
+than `files_with_findings`. They count only emitted findings when scan limits
+truncate results and do not affect `manifest_hash`.
+
+`summary.by_category` counts emitted findings for `dependency-vuln`, `secret`, and
+`config`, including zero counts. Its values sum to the length of `findings`, even
+when scan limits truncate the report. A dependency finding may represent several
+advisories; the count is not the number of advisories. Zero dependency findings
+does not certify coverage (see `summary.osv_enabled` above). These counts do not
+affect `manifest_hash`.
+
+`summary.by_category_severity` breaks each category count down into `critical`,
+`high`, `medium`, `low`, and `unknown`, including zeros. For example,
+`summary.by_category_severity.secret.high` counts emitted high-severity secret
+findings. Each row sums to its `summary.by_category` count, and each severity
+column sums to its `summary.by_severity` count. These are raw severities, unchanged
+by `--triage`, and count only emitted findings when limits truncate the report.
+This summary does not affect `manifest_hash` or the `--fail-on` exit gate.
+
+`summary.dependency_findings_with_fixes` counts emitted dependency findings with
+at least one reported `fixed_in` version. Each package/version finding counts
+once, even with multiple advisories or fixed versions. This counts reported fix
+metadata, not verified upgrade recommendations: a listed version need not fix
+every advisory in the finding. Empty, offline, and no-fix reports return zero;
+zero does not certify coverage or prove no fix exists. Finding limits can omit
+dependencies from this count. The field does not affect gates or `manifest_hash`.
+
+`summary.highest_severity` is the highest severity in the emitted findings,
+ordered `critical`, `high`, `medium`, `low`, then `unknown`. It is `unknown` when
+all findings are unrated and JSON `null` when no findings were emitted. It uses
+raw severity, unchanged by `--triage`; `unknown` never triggers `--fail-on`.
+Scan limits can omit more severe findings, and an empty report does not certify
+coverage. Check `summary.truncated`, `summary.osv_enabled`, notes and errors.
+This summary field does not affect `manifest_hash`.
+
+`summary.unique_advisories` counts distinct advisory ID strings in emitted
+`dependency-vuln` findings. A shared ID counts once across packages and versions;
+different IDs count separately even if they are aliases for the same issue.
+This differs from `summary.vulnerable_packages`, which counts affected inventory
+entries before finding limits. File and finding limits bound the advisory count.
+Zero means no advisory IDs were emitted, including with `--no-osv`; it does not
+certify coverage or successful lookups. Check errors, notes and truncation flags.
+This summary field does not affect `manifest_hash`.
+
+When `--fail-on` is supplied, `summary.gate` records the normalized `threshold`,
+the number of emitted raw findings at or above it (`matching_findings`), and
+`passed` (true when that count is zero). `unknown` never matches a threshold;
+`--triage` does not change the gate. The field is omitted without `--fail-on`
+and does not affect `manifest_hash`. Passing describes the exit-code gate,
+not complete coverage: review errors, notes and truncation flags, since discarded
+findings cannot contribute to the count.
+
+`summary.limits` records the applied caps: `files` (candidate files visited),
+`findings` (total findings emitted), and `findings_per_file` (findings emitted
+per file across all categories). These are limits, not observed counts; consult
+`summary.truncated` to see whether file or finding results were omitted at those
+caps. A false truncation flag does not certify complete coverage: other filters
+and limits still apply. This metadata does not affect `manifest_hash`.
+
+`summary.highest_severity_by_file` maps each affected relative file path to its
+highest emitted finding severity, with paths sorted lexically. `unknown` ranks
+below `low`; files without findings are omitted, and an empty scan returns `{}`.
+This summarizes emitted findings only, so finding caps can hide higher-severity
+results. Check `summary.truncated` for incomplete results. Like the overall
+highest severity, this field does not affect `manifest_hash`.
 
 ### Triage (`--triage`)
 
@@ -124,6 +281,9 @@ and `manifest_hash` stay untouched:
 - `triage_summary` — counts and a one-line `headline`: dependency advisories split
   into `upgradeable` (a patched release exists) vs `monitor_only` (no patch yet),
   and secret hits split into `needs_review` vs `likely_false_positive`.
+  `config.needs_review` counts configuration findings and includes them in the
+  headline, including when no secrets or dependency findings exist. Like other
+  triage counts, it covers only emitted findings when scan limits truncate results.
 - `triage` — a map from finding `id` to an interpretation: for a `dependency-vuln`,
   `action` is `upgrade` (with `upgrade_to`) or `monitor`; for a `secret`,
   `likely_false_positive` is set true when the hit sits in a test/fixture/example/CI
@@ -135,6 +295,13 @@ and `manifest_hash` stay untouched:
 This is purely deterministic prioritisation (fix-status + path-based false-positive
 classification). It never clears a secret found in real source — it flags it for a
 human. It exists so a reader does not have to hand-triage a long raw list.
+
+`triage_summary.by_action` counts findings assigned to `upgrade`, `monitor`,
+`review`, and `informational`, including zero-valued buckets. Counts sum to the
+number of emitted findings, not files or advisory IDs. `review` includes config
+findings; scaffold dependency findings retain their upgrade/monitor action.
+When scan limits truncate the report, these counts cover only emitted findings.
+This field is present only with `--triage` and does not change the severity gate.
 
 ## What it checks
 
@@ -165,6 +332,12 @@ else a numeric CVSS score from the `severity` list mapped ≥9 critical, ≥7 hi
 ≥4 medium, else low; `unknown` when neither is available. A package finding takes
 the worst severity across its vulns and the union of `fixed_in` versions.
 
+CVSS vector strings are not evaluated. An advisory with only vector strings and
+no recognized `database_specific.severity` remains `unknown`. Packages with such
+advisories can still produce dependency findings, subject to finding limits;
+other rated advisories can raise a package finding's severity. `unknown` findings do not trigger `--fail-on`,
+even at `low`. A passing severity gate therefore does not clear unrated advisories.
+
 HTTP timeout is 20 s per call. Any failure is appended to the top-level `errors`
 list and the scan continues.
 
@@ -175,16 +348,78 @@ Regex scan of text files ≤ 1 MiB. Binary files (null byte), `.git/`,
 binary/image extensions are skipped. Evidence is always redacted to the first 4
 characters plus `…`.
 
+The generic-assignment check skips values starting with `http://`, `https://`,
+`ws://` or `wss://` (case-insensitive). This excludes endpoint strings, not all
+secrets inside URLs: provider-token patterns still report with redacted evidence.
+Other schemes and malformed URL prefixes do not get this exclusion.
+
+Single-line provider patterns and generic assignments are checked only on lines
+of at most 4,000 characters (excluding the line ending; Unicode characters count
+as one character each). Longer lines are skipped, but later lines in the same
+file are still checked. The separate multiline private-key block check is not
+subject to this per-line limit; the file-size and file-selection limits above
+still apply. A report with no secret findings does not establish that skipped
+lines are free of secrets.
+
+The 1 MiB limit is 1,048,576 file bytes, not decoded characters. A file exactly
+at the limit can be scanned; larger files are skipped entirely, including any
+secret on the first line. Other eligible files are still scanned. An oversized
+file can still count in `summary.files_scanned`; skipping its text does not set
+`summary.truncated`, whose flags describe file-count and finding-count caps.
+An empty findings list with both flags false therefore does not establish that
+all file contents were checked.
+
+Extension exclusions apply before reading the content and are case-insensitive:
+even readable text in `.svg` / `.SVG` files is omitted from secret scanning.
+Such files still count in `summary.files_scanned`; skipping them does not set
+`summary.truncated`. Secrets found only in excluded files cannot trigger the
+severity gate, so a passing gate does not establish that those files are clear.
+
 | Pattern | Severity |
 | --- | --- |
 | `AKIA[0-9A-Z]{16}` (AWS access key id) | high |
 | `gh[pousr]_[A-Za-z0-9]{36,}` | high |
 | `github_pat_[A-Za-z0-9_]{80,}` | high |
+| `glpat-` + 20 URL-safe characters (GitLab personal access token) | high |
+| `npm_` + 36 alphanumerics (npm access token) | high |
+| `sk-` or `sk-proj-` + 40+ URL-safe characters (OpenAI; excludes `sk-ant-`) | high |
+| `sk-ant-` + 40+ URL-safe characters (Anthropic) | high |
+| `hf_` + 34+ alphanumerics (Hugging Face) | medium |
+| `SG.` + 22 URL-safe characters + `.` + 43 URL-safe characters (SendGrid) | high |
+| digits + `:` + 35 URL-safe characters (Telegram bot token) | high |
+| `SK` + 32 hex characters (Twilio API key SID) | medium |
 | `xox[baprs]-[0-9A-Za-z-]{10,}` (Slack) | high |
 | `sk_live_[0-9a-zA-Z]{24,}` (Stripe live) | critical |
 | `AIza[0-9A-Za-z_-]{35}` (Google API key) | medium |
-| `-----BEGIN … PRIVATE KEY-----` | critical |
-| generic `key/secret/password/token = "…16+ chars"` | medium |
+| Complete multiline `BEGIN … PRIVATE KEY` / matching `END` block | critical |
+| Known private-key header followed by a base64-looking line (legacy fallback) | critical |
+| generic `api_key` / `api-key` / `apikey` / `secret` / `password` / `passwd` / `token` assignment | medium |
+| Stripe live restricted key (`rk_live_` + 24+ alphanumeric characters) | high |
+
+Generic assignment names above are case-insensitive; bare `key` is not recognized
+by this rule. Assignments use `=` or `:` followed by a single- or double-quoted
+value of at least 16 characters with no whitespace or embedded quotes.
+Generic assignment keys may also be enclosed in paired single or double quotes,
+such as JSON's `"password": "…16+ chars"`. This is a line-based heuristic, not a
+JSON/YAML parser; the existing value exclusions and hint downgrades still apply.
+
+URL-safe characters above are `A-Z`, `a-z`, `0-9`, `_`, and `-`.
+
+Complete private-key blocks accept any uppercase/space label (including unlabelled
+`PRIVATE KEY`), require at least three base64 body lines, and produce one
+`Multiline private key block detected` finding on the header line. That finding
+replaces the legacy header hit. Body hints reuse the existing example/mask and
+value-shape checks to downgrade to **low**; a short placeholder body such as `...`,
+`YOUR_KEY_HERE`, `REDACTED`, or `xxxx` is also retained as a low finding. Evidence
+never includes the body. A bare header in source without a body remains ignored.
+
+The legacy header fallback also emits a **critical** `Private key block detected`
+finding for an unlabelled, RSA, EC, OPENSSH, DSA or PGP private-key header when
+the next line contains at least 20 characters from `A-Z`, `a-z`, `0-9`, `+`, `/`
+or `=` (with optional surrounding whitespace). This fallback does not require a
+footer or a complete key, and does not apply body placeholder downgrades. Its
+evidence contains only the redacted header. These are text-shape checks, not
+proof that the body is valid base64 or usable private-key material.
 
 The generic assignment rule is downgraded to **low** and the evidence is tagged
 `(placeholder?)` when the value matches
@@ -213,14 +448,43 @@ it is still listed. Test-path rule also widened in v0.4.1: `__fixtures__`, `__mo
 
 ### 3. `config`
 
-* `.env` / `.env.*` committed with at least one `KEY=value` line — high.
+* `.env` / `.env.*` with at least one assignment (`KEY=value`, optionally prefixed
+  by `export`) — high. Filenames ending exactly in lowercase `.example`, `.sample`,
+  `.template`, or `.dist` are exempt from this configuration check. This exemption
+  does not suppress secret-pattern scanning: a credential-shaped value in an
+  otherwise eligible template file can still produce a secret finding and trip
+  `--fail-on`. Template filenames do not certify that their contents are safe.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction — low, "runs as root".
 * `Dockerfile` with `ADD http(s)://…` — low.
-* `docker-compose*.yml` / `compose.yml` containing `privileged: true` — medium.
-* `.github/workflows/*.y(a)ml` using `pull_request_target` **and**
-  `actions/checkout` **and** `${{ github.event.pull_request.head` — high,
-  "pwn request pattern".
+* `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` containing a plain
+  `privileged: true` declaration — medium. The key may be unquoted or enclosed in
+  matching single or double quotes; the value must remain plain `true`.
+  This line-based heuristic allows trailing
+  comments, but ignores commented declarations, unrelated keys and longer scalar
+  values such as `trueish`; it does not parse general YAML structure.
+* `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs
+  that are not full 40-character hexadecimal commit SHAs — low. Includes
+  `actions/*`; local `./` actions and `docker://` references are excluded.
+* Workflows triggered by `pull_request` with workflow/job `permissions:` declaring
+  `write-all` or a scope set to `write` — medium. This flags requested permissions;
+  job overrides, fork restrictions and repository policy can reduce actual access.
+* `pull_request_target` workflows where an `actions/checkout` step's `with.ref`
+  uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
+  `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
 * `.npmrc` / `.pypirc` containing `_authToken=` or a `password` line — high.
+  Spaces or tabs before `=` are also accepted for an unscoped or registry-scoped
+  `_authToken` key beginning the line after optional whitespace. The legacy exact
+  `_authToken=` substring check remains; spaced markers inside other option names,
+  values, or trailing comments do not trigger the added whitespace form.
+  Empty or whitespace-only `password=` / `password:` fields are ignored;
+  later credential lines are still checked. Quoted values and inline comments
+  after the delimiter remain nonempty for this conservative heuristic.
+  In `.npmrc`, an unscoped or registry-scoped `_authToken` value consisting only
+  of `${NAME}` (a variable name using letters, digits and underscores, starting
+  with a letter or underscore) is excluded. Mixed literal/reference values are
+  still flagged; environment variables are never read or expanded.
+  This configuration check skips full-line `#` and `;` comments (including
+  indented comments). Secret-pattern scanning still checks commented text.
 
 All config checks listed above are implemented.
 
@@ -228,6 +492,13 @@ All config checks listed above are implemented.
 
 * **Deterministic only.** Pure regex/parser matching plus OSV lookups. No LLM,
   no reachability analysis, no taint tracking.
+* **Workflow checks are YAML heuristics**, limited to files directly in the scanned
+  root's `.github/workflows/`. They understand block mappings, step lists, scalar/
+  list/mapping event declarations and simple inline permission maps. Comments and
+  literal/folded script bodies are ignored. Anchors/aliases, general flow mappings
+  (including inline steps/checkout inputs), multiline quoted scalars and indirect
+  expressions are not resolved; these forms may be missed. These checks are review
+  prompts, not proof of exploitability or a complete workflow audit.
 * **No false-positive review.** Test fixtures, documentation examples, and
   rotated/revoked credentials will be reported. The only heuristic filters are
   the path rules and the value-shape hints (v0.4.1) described above; a committed
@@ -235,6 +506,10 @@ All config checks listed above are implemented.
 * **No git history scan.** Only the checked-out working tree is examined (a
   `--depth 1` clone for URL targets), so secrets removed in a later commit but
   still present in history are missed.
+* **Local scans do not honor `.gitignore` or restrict files to Git's index.**
+  Untracked and ignored regular files are scanned too, subject to the scanner's
+  directory/file exclusions and size/count limits. Findings in those files can
+  trigger `--fail-on`; an ignored local file is not evidence that it was committed.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
 * Go: `go.mod`'s `require` set (direct + indirect) is the build list and is what
@@ -244,14 +519,51 @@ All config checks listed above are implemented.
   `govulncheck` for that.
 * Yarn v1 and Yarn Berry (v2+) lockfiles are parsed (Berry since v0.4; workspace/
   patch/portal entries are skipped). `composer.lock`, Maven/Gradle and NuGet are not.
-* `summary.lockfiles_parsed` lists what was actually read; when nothing was,
-  `summary.notes` says so — a zero is not "clean". Dependency hits whose lockfile
+* `summary.lockfiles_parsed` lists supported, readable manifests whose parser
+  returned normally, even if it returned no packages. Empty files, unpinned
+  requirements and some malformed inputs (such as invalid package-lock JSON)
+  can appear here without an `errors` entry. A nonempty list does not establish
+  syntax validity, package discovery or advisory lookup success. Unsupported
+  files and manifests over the 8 MiB read limit are omitted. The "No supported
+  dependency manifest was parsed" note appears only when this list is empty;
+  check `summary.packages_found`, `summary.osv_enabled` and `errors` as well.
+  Dependency hits whose lockfile
   sits under a test/fixture/example/benchmark path are tagged `scaffold` by
   `--triage` (low priority), and a package listed in both a fixture and a shipped
   lockfile is attributed to the shipped one.
 * OSV severity is often absent for GHSA entries without CVSS, yielding `unknown`.
-* Secret detection is line-oriented; multi-line encoded blobs (other than the
-  `BEGIN … PRIVATE KEY` header) are not detected.
+* Secret detection is line-oriented except for complete multiline private-key
+  blocks with matching labels and the header/next-line fallback described above.
+  An incomplete block can still produce a critical fallback finding. PEM metadata
+  lines, escaped newlines and other multiline encoded blobs are not parsed. Block
+  bodies are checked for base64 shape, not decoded or cryptographically validated;
+  synthetic examples can match.
+
+## Dockerfile checks
+
+For `Dockerfile` and `Dockerfile.*`, config findings also cover:
+
+* `ADD` with an HTTP(S) source, including JSON operands and leading options — low.
+  URLs are omitted from evidence, including user info and query strings.
+* Shell-form `RUN` directly piping `curl` into `sh` or `bash` — medium.
+* `ENV`/`ARG` assignments with nonempty values and secret-like variable names
+  (for example `API_TOKEN`, `DB_PASSWORD`, `PRIVATE_KEY`, `AWS_SECRET_ACCESS_KEY`)
+  — high. Only names are reported. Unset arguments, empty values and plain
+  `$NAME`/`${NAME}` references are excluded; synthetic/default values may still
+  be flagged. This is a configuration warning, not credential validation.
+* `FROM` with an explicit `:latest` or no tag — low. Digest-pinned images,
+  `scratch`, prior build-stage names and variable-based references are excluded.
+* The last `USER` in the final stage explicitly sets `root` or UID `0`, optionally
+  with a literal group (`root:app`, `0:1000`) — low. Earlier stages and overridden
+  users are excluded. Variable-based users, inherited image users, and user-name
+  to UID mappings are not resolved; a root group alone does not trigger this check.
+
+These are bounded syntax heuristics. Continuations retain the first physical
+line number, comments and simple named heredoc bodies are skipped, and malformed
+quoted instructions are ignored. Heredoc scripts, exec-form shell commands,
+indirect pipelines, variable expansion, custom shells and full Dockerfile/shell
+grammar are not evaluated. The existing missing-`USER` check considers the whole
+file, not each stage. Findings are review prompts, not proof of a vulnerable build.
 
 ## Datasets
 
@@ -264,11 +576,21 @@ scripts to reproduce them, live under [`datasets/`](datasets/):
 
 ## Beyond this scanner
 
-The paid tier is a three-pass AI review with reproduction of what pattern
-matching cannot see (auth and injection flaws, logic bugs, race conditions),
-$49 for repositories up to about 30k lines: <https://project-feldspar.com/>.
+The paid tier is a three-pass AI review of what pattern matching cannot see
+(auth and injection flaws, logic bugs, race conditions): the $49 Codebase Audit
+Report for repositories up to about 50k lines, and deep audits with reproductions
+from $149: <https://project-feldspar.com/> (prices plus any tax at checkout).
 Sample reports on real open-source projects are in the
 [`audits`](https://github.com/project-feldspar-resources/audits) repository.
+
+## Terms
+
+This scanner, the hosted scan at `/scan/`, its API, the MCP endpoint and this
+GitHub Action are free tools provided under section 2.5 of the L3Digital Standard
+Commercial Terms v1.1: <https://project-feldspar.com/terms/v1.1#s2-5> (as is, no
+warranty or support commitment; use them only on code you may lawfully scan).
+The code itself stays MIT-licensed (below). Privacy notice for the hosted
+service: <https://project-feldspar.com/privacy>.
 
 ## License
 

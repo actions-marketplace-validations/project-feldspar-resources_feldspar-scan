@@ -2,8 +2,16 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage]
+               [--fail-on SEV] [--triage] [--compact]
+       scan.py --version
 
+  --version       print scanner name and version, then exit (standalone invocation).
+
+  --json PATH     write JSON to PATH; use - for stdout (also the default).
+  --compact       write JSON on one line, to stdout or --json PATH.
+  --no-osv        skip OSV dependency advisory lookups;
+                  package inventory and local secret/config checks still run.
+                  URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
@@ -15,10 +23,16 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                   v0.4: dependency hits from lockfiles under test/fixture/example/benchmark
                   paths are tagged scaffold (low priority).
 
+Exit codes: 0 no severity gate fired; 1 gate fired (--fail-on);
+            2 bad args / bad path; 3 clone failed.
+Without --fail-on, findings do not change the exit code. Code 0 does not certify a complete assessment.
+Review errors, summary.notes, summary.lockfiles_parsed, and summary.packages_found in the report.
+
 v0.4 (2026-10-08, from the 25-repo dataset in datasets/): go.mod is the Go build list and is
 preferred over go.sum (which lists superseded versions too); Yarn Berry lockfiles are parsed;
-`summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed; URL values
-are never reported as hardcoded secrets.
+`summary.lockfiles_parsed` + a `summary.notes` warning when no manifest was parsed.
+Generic assignments whose values start with http://, https://, ws:// or wss://
+(case-insensitive) are skipped; provider-token patterns inside URLs still report.
 v0.4.1 (2026-10-08): second secret heuristic beyond paths — value-shape hints (template/env
 references, localized text, dotted identifier names, digit-less word-like values, form
 placeholders, documented example keys and masked values) tag the evidence `(hint?)`, drop the raw
@@ -32,12 +46,15 @@ import hashlib
 import json
 import os
 import re
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from itertools import islice
 
 try:
     import tomllib
@@ -45,7 +62,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.2"
+VERSION = "0.4.13"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -57,25 +74,56 @@ BIN_EXT = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".pdf", ".zip", ".gz
 LOCKFILES = {"package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
              "uv.lock", "Cargo.lock", "Gemfile.lock", "go.sum", "go.mod", "composer.lock"}
 MAX_TEXT = 1024 * 1024
+MAX_FINDINGS_PER_FILE = 100
+MAX_FINDINGS = 5000
+MAX_FILES = 50000
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 ERRORS = []
 PARSED_LOCKFILES = []   # relative paths of dependency manifests actually parsed (v0.4; summary.lockfiles_parsed)
 
 
 # ---------------------------------------------------------------- utilities
-def walk(root):
+def walk(root, skipped=None, max_files=None):
+    yielded = 0
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-        for fn in filenames:
-            yield os.path.join(dirpath, fn)
+        regular_dirs = []
+        for dirname in sorted(dirnames):
+            if dirname in SKIP_DIRS:
+                continue
+            try:
+                is_dir = stat.S_ISDIR(os.lstat(os.path.join(dirpath, dirname)).st_mode)
+            except OSError:
+                is_dir = False
+            if is_dir:
+                regular_dirs.append(dirname)
+            elif skipped is not None:
+                skipped["non_regular"] += 1
+        dirnames[:] = regular_dirs
+        for fn in sorted(filenames):
+            path = os.path.join(dirpath, fn)
+            try:
+                regular = stat.S_ISREG(os.lstat(path).st_mode)
+            except OSError:
+                regular = False
+            if regular:
+                yield path
+                yielded += 1
+                if max_files is not None and yielded >= max_files:
+                    return
+            elif skipped is not None:
+                skipped["non_regular"] += 1
 
 
 def read_text(path, limit=MAX_TEXT):
     try:
-        if os.path.getsize(path) > limit:
-            return None
-        with open(path, "rb") as fh:
-            raw = fh.read(limit)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+                return None
+            raw = fh.read(limit + 1)
+            if len(raw) > limit:
+                return None
     except OSError:
         return None
     if b"\x00" in raw:
@@ -117,13 +165,22 @@ def parse_toml_packages(text, ecosystem):
     if tomllib:
         try:
             data = tomllib.loads(text)
-            for pkg in data.get("package", []) or []:
-                n, v = pkg.get("name"), pkg.get("version")
-                if n and v:
-                    out.append((ecosystem, n, str(v)))
-            return out
-        except Exception:
-            pass
+        except (ValueError, RecursionError):
+            # Includes invalid TOML, oversized integers and excessive nesting.
+            return []
+        packages = data.get("package", []) or []
+        if not isinstance(packages, list):
+            return []
+        for pkg in packages:
+            if not isinstance(pkg, dict):
+                return []
+            n, v = pkg.get("name"), pkg.get("version")
+            if n and v:
+                if not isinstance(n, str) or not isinstance(v, str):
+                    return []
+                out.append((ecosystem, n, str(v)))
+        return out
+    # Older Python versions without tomllib retain the line-based fallback.
     name = ver = None
     for line in text.splitlines():
         s = line.strip()
@@ -144,8 +201,13 @@ def parse_toml_packages(text, ecosystem):
 def parse_package_lock(text):
     out = []
     try:
+        if text.startswith("\ufeff"):
+            text = text[1:]  # Some producers emit a UTF-8 BOM; json.loads(str) rejects it.
         data = json.loads(text)
-    except Exception:
+    except (ValueError, RecursionError):
+        # JSON syntax errors, integer conversion limits and excessive nesting.
+        return out
+    if not isinstance(data, dict):
         return out
     pkgs = data.get("packages")
     if isinstance(pkgs, dict):
@@ -157,18 +219,24 @@ def parse_package_lock(text):
                 name = key.rsplit("node_modules/", 1)[1]
             else:
                 continue
-            if name and ver:
-                out.append(("npm", name, str(ver)))
+            if name and isinstance(ver, str) and ver:
+                out.append(("npm", name, ver))
     deps = data.get("dependencies")
     if isinstance(deps, dict) and not out:
-        def rec(d):
-            for name, meta in d.items():
-                if isinstance(meta, dict):
-                    if meta.get("version"):
-                        out.append(("npm", name, str(meta["version"])))
-                    if isinstance(meta.get("dependencies"), dict):
-                        rec(meta["dependencies"])
-        rec(deps)
+        # Preserve depth-first order without consuming Python's call stack.
+        stack = [iter(deps.items())]
+        while stack:
+            item = next(stack[-1], None)
+            if item is None:
+                stack.pop()
+                continue
+            name, meta = item
+            if isinstance(meta, dict):
+                ver = meta.get("version")
+                if isinstance(ver, str) and ver:
+                    out.append(("npm", name, ver))
+                if isinstance(meta.get("dependencies"), dict):
+                    stack.append(iter(meta["dependencies"].items()))
     return out
 
 
@@ -185,11 +253,18 @@ def parse_yarn_lock(text):
         if line.startswith("__metadata"):
             names = []
             continue
-        if line and not line.startswith((" ", "\t", "#")) and line.rstrip().endswith(":"):
+        if line and not line.startswith((" ", "\t", "#")):
             names = []
+            if not line.rstrip().endswith(":"):
+                continue
             spec = line.rstrip()[:-1]
+            if spec.startswith('"') and spec.endswith('"') and spec.count('"') == 2:
+                spec = spec[1:-1]  # Yarn can quote the entire comma-separated descriptor list.
             for part in spec.split(","):
-                part = part.strip().strip('"')
+                part = part.strip()
+                if part.startswith('"') != part.endswith('"'):
+                    continue  # An unbalanced quoted descriptor is incomplete.
+                part = part.strip('"')
                 if not part:
                     continue
                 # split at the FIRST "@" after the (possibly @scoped/) name: a Berry
@@ -203,9 +278,11 @@ def parse_yarn_lock(text):
                         continue
                     names.append(part[:at])
         else:
-            m = re.match(r'^\s+version:?\s+"?([^"\s]+)"?', line)
+            m = re.fullmatch(
+                r'\s+version:?\s+(?:"([^"\s]+)"|\'([^\'\s]+)\'|([^\s"\'#]+))\s*(?:#.*)?',
+                line)
             if m and names:
-                ver = m.group(1)
+                ver = next(group for group in m.groups() if group is not None)
                 if re.match(r"^\d", ver):
                     for n in dict.fromkeys(names):
                         out.append(("npm", n, ver))
@@ -224,10 +301,11 @@ def parse_pnpm_lock(text):
             in_pkgs = False
         if not in_pkgs:
             continue
-        m = re.match(r"^\s{2}'?(/?[^:'\s]+)'?:\s*$", line)
+        # A quoted key must have both quotes; a truncated key is not a package.
+        m = re.match(r"^\s{2}(?:'(/?[^:'\s]+)'|(/?[^:'\s]+)):\s*$", line)
         if not m:
             continue
-        key = m.group(1).lstrip("/")
+        key = (m.group(1) or m.group(2)).lstrip("/")
         key = key.split("(", 1)[0]
         at = key.rfind("@")
         if at <= 0:
@@ -245,12 +323,14 @@ def parse_go_sum(text):
     out = []
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) < 2:
+        # A go.sum record has exactly a module, version, and h1 checksum.
+        # Ignore truncated or malformed records instead of reporting a dependency.
+        if len(parts) != 3 or not parts[2].startswith("h1:") or len(parts[2]) == 3:
             continue
         mod, ver = parts[0], parts[1]
         if ver.endswith("/go.mod"):
             ver = ver[: -len("/go.mod")]
-        if mod and ver.startswith("v"):
+        if mod and ver.startswith("v") and len(ver) > 1:
             out.append(("Go", mod, ver))
     return out
 
@@ -263,7 +343,7 @@ def parse_go_mod(text):
         s = line.split("//", 1)[0].strip()
         if not s:
             continue
-        if s.startswith("require ("):
+        if re.fullmatch(r"require\s+\(", s):
             in_req = True
             continue
         if in_req and s == ")":
@@ -281,13 +361,16 @@ def parse_go_mod(text):
 
 def parse_gemfile_lock(text):
     out = []
+    in_gem = False
     in_specs = False
     for line in text.splitlines():
-        if re.match(r"^\s{2}specs:\s*$", line):
+        if line and not line[0].isspace():
+            in_gem = line == "GEM"
+            in_specs = False
+            continue
+        if in_gem and re.match(r"^\s{2}specs:\s*$", line):
             in_specs = True
             continue
-        if line and not line.startswith(" "):
-            in_specs = False
         if not in_specs:
             continue
         m = re.match(r"^\s{4}([A-Za-z0-9_.\-]+) \(([^)]+)\)\s*$", line)
@@ -453,11 +536,15 @@ EXAMPLE_KEYS = {
     "ghp_16C7e42F292c6912E7710c838347Ae178B4a",               # GitHub docs example token
 }
 MASKED_RE = re.compile(r"x{6,}|X{6,}|0{8,}|\*{4,}|EXAMPLE")
-PLACEHOLDER_ATTR_RE = re.compile(r"placeholder\s*[:=]\s*[{'\"]", re.I)
+# Match only an open value in the prefix before a hit, not a closed earlier field.
+PLACEHOLDER_ATTR_RE = re.compile(
+    r"""(?<![\w-])placeholder\s*[:=]\s*(?:"[^"]*|'[^']*|\{[^}]*)$""", re.I)
 
 
 def _value_hint(value, line_prefix=""):
     """Shape hint for a generic `key = "value"` hit (None = looks like a literal credential)."""
+    if re.fullmatch(r"\.{3,}", value):
+        return "placeholder?"
     if re.search(r"example|changeme|your[_-]|xxx|dummy|placeholder|<|\$\{", value, re.I):
         return "placeholder?"
     if any(ord(c) > 127 for c in value):
@@ -492,17 +579,47 @@ def _generic_sev(match_value, line_prefix=""):
 
 
 SECRET_PATTERNS = [
-    ("aws-access-key-id", re.compile(r"AKIA[0-9A-Z]{16}"), "high", "AWS access key ID"),
-    ("github-token", re.compile(r"gh[pousr]_[A-Za-z0-9]{36,}"), "high", "GitHub token"),
-    ("github-pat", re.compile(r"github_pat_[A-Za-z0-9_]{80,}"), "high", "GitHub fine-grained PAT"),
-    ("slack-token", re.compile(r"xox[baprs]-[0-9A-Za-z-]{10,}"), "high", "Slack token"),
-    ("stripe-live-key", re.compile(r"sk_live_[0-9a-zA-Z]{24,}"), "critical", "Stripe live secret key"),
-    ("google-api-key", re.compile(r"AIza[0-9A-Za-z_\-]{35}"), "medium", "Google API key"),
+    ("aws-access-key-id", re.compile(r"(?<!\w)AKIA[0-9A-Z]{16}(?!\w)"),
+     "high", "AWS access key ID"),
+    ("github-token", re.compile(r"(?<!\w)gh[pousr]_[A-Za-z0-9]{36,}(?!\w)"),
+     "high", "GitHub token"),
+    ("github-pat", re.compile(r"(?<!\w)github_pat_[A-Za-z0-9_]{80,}(?!\w)"),
+     "high", "GitHub fine-grained PAT"),
+    ("gitlab-pat", re.compile(r"(?<![\w-])glpat-[A-Za-z0-9_-]{20}(?![\w-])"),
+     "high", "GitLab personal access token"),
+    ("npm-token", re.compile(r"(?<!\w)npm_[A-Za-z0-9]{36}(?!\w)"),
+     "high", "npm access token"),
+    ("openai-api-key", re.compile(r"(?<![\w-])sk-(?:proj-[A-Za-z0-9_-]{40,}|(?!proj-|ant-)[A-Za-z0-9_-]{40,})(?![\w-])"),
+     "high", "OpenAI API key"),
+    ("anthropic-api-key", re.compile(r"(?<![\w-])sk-ant-[A-Za-z0-9_-]{40,}(?![\w-])"),
+     "high", "Anthropic API key"),
+    ("huggingface-token", re.compile(r"(?<!\w)hf_[A-Za-z0-9]{34,}(?!\w)"),
+     "medium", "Hugging Face token"),
+    ("sendgrid-api-key", re.compile(r"(?<![\w-])SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![\w-])"),
+     "high", "SendGrid API key"),
+    ("telegram-bot-token", re.compile(r"(?<![\w-])[0-9]+:[A-Za-z0-9_-]{35}(?![\w-])"),
+     "high", "Telegram bot token"),
+    ("twilio-api-key-sid", re.compile(r"(?<!\w)SK[0-9a-fA-F]{32}(?!\w)"),
+     "medium", "Twilio API key SID"),
+    ("slack-token", re.compile(r"(?<![\w-])xox[baprs]-[0-9A-Za-z-]{10,}(?![\w-])"),
+     "high", "Slack token"),
+    ("stripe-live-key", re.compile(r"(?<!\w)sk_live_[0-9a-zA-Z]{24,}(?!\w)"),
+     "critical", "Stripe live secret key"),
+    ("stripe-restricted-key", re.compile(r"(?<!\w)rk_live_[0-9a-zA-Z]{24,}(?!\w)"),
+     "high", "Stripe live restricted key"),
+    ("google-api-key", re.compile(r"(?<![\w-])AIza[0-9A-Za-z_-]{35}(?![\w-])"),
+     "medium", "Google API key"),
     ("private-key", re.compile(r"-----BEGIN (RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----"),
      "critical", "Private key block"),
 ]
+# Unicode alphanumerics extend a name; underscores remain suffix separators.
 GENERIC = re.compile(
-    r"""(?i)(api[_-]?key|secret|password|passwd|token)\s*[:=]\s*['"]([^'"\s]{16,})['"]""")
+    r"""(?i)(?<![^\W_])(?P<quote>['"]?)(?P<name>api[_-]?key|secret|password|passwd|token)(?P=quote)"""
+    r"""\s*[:=]\s*(?P<value_quote>['"])(?P<value>[^'"\s]{16,})(?P=value_quote)""")
+PRIVATE_KEY_BLOCK = re.compile(
+    r"^[ \t]*-----BEGIN (?P<label>[A-Z ]*PRIVATE KEY)-----[ \t]*\r?\n"
+    r"(?P<body>(?:[ \t]*[A-Za-z0-9+/=_.*-]+[ \t]*\r?\n)+)"
+    r"[ \t]*-----END (?P=label)-----[ \t]*\r?$", re.M)
 
 
 def scan_secrets(root, files, add):
@@ -516,38 +633,150 @@ def scan_secrets(root, files, add):
             continue
         rel = os.path.relpath(path, root)
         lines = text.splitlines()
+        block_headers = set()
+        for m in PRIVATE_KEY_BLOCK.finditer(text):
+            body_lines = [line.strip() for line in m.group("body").splitlines()]
+            body = "".join(body_lines)
+            note = _pattern_hint(body) or _value_hint(body)
+            # Complete blocks need at least three base64 lines. Recognizable examples
+            # may replace that body with a short mask/placeholder; keep them as low hits.
+            if not note and (len(body_lines) < 3 or any(
+                    not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", line)
+                    for line in body_lines)):
+                continue
+            lineno = text.count("\n", 0, m.start()) + 1
+            block_headers.add(lineno)
+            ev = redact(m.group(0).lstrip())
+            if note:
+                ev += " (%s)" % note
+            add("secret", "low" if note else "critical", rel, lineno,
+                summary="Multiline private key block detected", evidence=ev)
         for lineno, line in enumerate(lines, 1):
             if len(line) > 4000:
                 continue
             for pid, rx, sev, desc in SECRET_PATTERNS:
-                m = rx.search(line)
-                if m:
+                for m in rx.finditer(line):
                     if pid == "private-key":
+                        if lineno in block_headers:
+                            continue  # the complete block supersedes this header-only hit
                         # a real PEM block is followed by a base64 body line; a header inside
                         # source code (regex/validator/test string) is not a leaked key
                         nxt = lines[lineno] if lineno < len(lines) else ""
                         if not re.match(r"^\s*[A-Za-z0-9+/=]{20,}\s*$", nxt):
                             continue
                     ev = redact(m.group(0))
+                    match_sev = sev
                     if pid != "private-key":
                         note = _pattern_hint(m.group(0), line[:m.start()])
                         if note:  # v0.4.1: AWS docs key / masked xoxb-xxxx… / form placeholder
-                            sev = "low"
+                            match_sev = "low"
                             ev += " (%s)" % note
-                    add("secret", sev, rel, lineno, summary=desc + " detected", evidence=ev)
-            gm = GENERIC.search(line)
-            if gm and re.match(r"^(https?|wss?)://", gm.group(2), re.I):
-                gm = None  # `OAUTH2_TOKEN = "https://…"` is an endpoint URL, not a credential (v0.4)
-            if gm:
-                sev, note = _generic_sev(gm.group(2), line[:gm.start(2)])
-                ev = redact(gm.group(2))
+                    add("secret", match_sev, rel, lineno, summary=desc + " detected", evidence=ev)
+            for gm in GENERIC.finditer(line):
+                if re.match(r"^(https?|wss?)://", gm.group('value'), re.I):
+                    continue  # Endpoint URLs are not credentials; check later assignments too.
+                sev, note = _generic_sev(gm.group('value'), line[:gm.start('value')])
+                ev = redact(gm.group('value'))
                 if note:
                     ev += " (%s)" % note
                 add("secret", sev, rel, lineno,
-                    summary="Hardcoded %s assignment" % gm.group(1).lower(), evidence=ev)
+                    summary="Hardcoded %s assignment" % gm.group('name').lower(), evidence=ev)
 
 
 # ---------------------------------------------------------------- config
+def _workflow_fields(text):
+    """Yield (line, parent path, key, value) for a bounded YAML block subset.
+
+    This is a heuristic, not a YAML loader: no anchors, aliases, multiline quoted
+    strings or general flow mappings. Ignore comments and literal/folded bodies
+    so shell scripts and examples do not become workflow configuration.
+    """
+    stack = []
+    block_indent = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        indent = len(raw) - len(raw.lstrip(' '))
+        if not raw.strip():
+            continue
+        if block_indent is not None:
+            if indent > block_indent:
+                continue
+            block_indent = None
+        # Preserve hashes inside quotes and unspaced hashes in plain scalars.
+        line = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:''|[^'])*'|(?<!\S)\#.*''',
+                      lambda m: '' if m.group().startswith('#') else m.group(), raw).strip()
+        if not line:
+            continue
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if line.startswith('- '):
+            if tuple(k for _, k in stack) == ('on',):
+                event = line[2:].strip().strip("\"'")
+                if re.fullmatch(r'[\w-]+', event):
+                    yield lineno, ('on',), event, ''
+                    continue
+            stack.append((indent, '@%d' % lineno))
+            indent += 2
+            line = line[2:].lstrip()
+        match = re.match(r'''(?:"([^"\n]+)"|'([^'\n]+)'|([\w-]+)):\s*(.*)$''', line)
+        if not match:
+            continue
+        key = next(k for k in match.groups()[:3] if k is not None)
+        value = match.group(4).strip()
+        parent = tuple(k for _, k in stack)
+        if re.fullmatch(r'[|>][+\-1-9]{0,2}', value):
+            block_indent = indent
+            continue
+        yield lineno, parent, key, value.strip("\"'")
+        stack.append((indent, key))
+
+
+def scan_workflow(text, rel, add):
+    """Check common workflow forms without adding a YAML dependency."""
+    fields = list(_workflow_fields(text))
+    events = set()
+    for _, parent, key, value in fields:
+        if parent == ('on',):
+            events.add(key)
+        elif not parent and key == 'on':
+            events.update(re.findall(r'(?:^|[\[{,])\s*[\"\']?'
+                                     r'(pull_request_target|pull_request)[\"\']?'
+                                     r'(?=\s*(?:[:,\]}]|$))', value))
+
+    checkouts = set()
+    for lineno, parent, key, value in fields:
+        job = len(parent) == 2 and parent[0] == 'jobs'
+        step = (len(parent) == 4 and parent[0] == 'jobs'
+                and parent[2] == 'steps' and parent[3].startswith('@'))
+        if key == 'uses' and (job or step):
+            remote = re.fullmatch(r'([\w.-]+/[\w./-]+)@(.+)', value)
+            if remote and not value.startswith(('./', '../')):
+                if not re.fullmatch(r'[0-9a-fA-F]{40}', remote.group(2)):
+                    add('config', 'low', rel, lineno,
+                        summary='Unpinned remote GitHub Action or reusable workflow',
+                        evidence='uses: remote reference is not a full commit SHA')
+                if step and remote.group(1).lower() == 'actions/checkout':
+                    checkouts.add(parent)
+
+    for lineno, parent, key, value in fields:
+        if 'pull_request' in events:
+            scope = parent[:-1] if parent and parent[-1] == 'permissions' else parent
+            permission_scope = not scope or (len(scope) == 2 and scope[0] == 'jobs')
+            write = (key == 'permissions' and (value == 'write-all' or
+                     re.search(r'''(?:\{|,)\s*[\w"'-]+\s*:\s*["']?write["']?\s*(?:,|\})''', value)))
+            write = write or (parent and parent[-1] == 'permissions' and value == 'write')
+            if permission_scope and write:
+                add('config', 'medium', rel, lineno,
+                    summary='PR-triggered workflow requests write permissions',
+                    evidence='pull_request + explicit write permission declaration')
+        if ('pull_request_target' in events and key == 'ref' and parent
+                and parent[-1] == 'with' and parent[:-1] in checkouts
+                and re.search(r'\$\{\{\s*github\.(?:event\.pull_request\.head\.(?:sha|ref)'
+                              r'|head_ref)\s*\}\}', value)):
+            add('config', 'high', rel, lineno,
+                summary='pull_request_target checks out PR head',
+                evidence='actions/checkout ref uses a pull request head expression')
+
+
 def scan_config(root, files, add):
     for path in files:
         base = os.path.basename(path)
@@ -563,45 +792,151 @@ def scan_config(root, files, add):
         if (base == ".env" or base.startswith(".env.")) and not re.search(r"\.(example|sample|template|dist)$", base):
             for lineno, line in enumerate(body().splitlines(), 1):
                 s = line.strip()
-                if s and not s.startswith("#") and re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=", s):
+                if s and not s.startswith("#") and re.match(r"^(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*\s*=", s):
                     add("config", "high", rel, lineno,
                         summary="Committed .env file with assignments",
                         evidence=redact(s.split("=", 1)[0]) + "=…")
                     break
         if base == "Dockerfile" or base.startswith("Dockerfile."):
-            lines = body().splitlines()
-            if not any(re.match(r"^\s*USER\s+\S", l, re.I) for l in lines):
-                add("config", "low", rel, None,
-                    summary="Dockerfile has no USER instruction (runs as root)",
-                    evidence="no USER directive")
-            for lineno, line in enumerate(lines, 1):
-                if re.match(r"^\s*ADD\s+https?://", line, re.I):
-                    add("config", "low", rel, lineno,
-                        summary="Dockerfile uses ADD with a remote URL",
-                        evidence=line.strip()[:80])
-        if re.match(r"^docker-compose.*\.ya?ml$", base) or base == "compose.yml":
+            _scan_dockerfile(body(), rel, add)
+        if re.match(r"^docker-compose.*\.ya?ml$", base) or base in ("compose.yml", "compose.yaml"):
             for lineno, line in enumerate(body().splitlines(), 1):
-                if re.search(r"privileged:\s*true", line, re.I):
+                if re.fullmatch(r'''\s*(["']?)privileged\1:\s*true(?:\s+#.*)?\s*''', line, re.I):
                     add("config", "medium", rel, lineno,
                         summary="docker-compose service runs privileged",
                         evidence="privileged: true")
-        if os.sep + os.path.join(".github", "workflows") + os.sep in path + os.sep and \
+        if os.path.dirname(rel) == os.path.join('.github', 'workflows') and \
                 base.endswith((".yml", ".yaml")):
-            t = body()
-            if "pull_request_target" in t and "actions/checkout" in t and \
-                    "${{ github.event.pull_request.head" in t:
-                lineno = next((i for i, l in enumerate(t.splitlines(), 1)
-                               if "pull_request_target" in l), None)
-                add("config", "high", rel, lineno,
-                    summary="pwn request pattern: pull_request_target checks out PR head",
-                    evidence="pull_request_target + actions/checkout of PR head")
+            scan_workflow(body(), rel, add)
         if base in (".npmrc", ".pypirc"):
             for lineno, line in enumerate(body().splitlines(), 1):
-                if "_authToken=" in line or re.match(r"^\s*password\s*[:=]", line, re.I):
+                if line.lstrip().startswith(("#", ";")):
+                    continue
+                if base == ".npmrc" and re.fullmatch(
+                        r"\s*(?://[^\s=]+:)?_authToken[ \t]*=\s*\$\{[A-Za-z_][A-Za-z0-9_]*\}\s*", line):
+                    continue  # A standalone environment reference contains no literal credential.
+                if re.fullmatch(r"\s*password\s*[:=]\s*", line, re.I):
+                    continue  # An empty password field contains no credential.
+                if ("_authToken=" in line
+                        or re.match(r"^\s*(?://[^\s=]+:)?_authToken[ \t]+=", line)
+                        or re.match(r"^\s*password\s*[:=]", line, re.I)):
                     add("config", "high", rel, lineno,
                         summary="Credential committed in %s" % base,
                         evidence=redact(line.strip()))
                     break
+
+
+def _docker_instructions(text):
+    """Yield logical instructions, excluding comments and heredoc bodies.
+
+    Bounded Dockerfile heuristic: supports backslash/backtick continuations and
+    simple named heredoc delimiters, not a full Dockerfile or shell parser.
+    """
+    escape, pending, start, heredocs = '\\', '', 0, []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if heredocs:
+            marker, tabs = heredocs[0]
+            if (raw.lstrip('\t') if tabs else raw) == marker:
+                heredocs.pop(0)
+            continue
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            directive = re.fullmatch(r'#\s*escape\s*=\s*([\\`])', line, re.I)
+            if directive and not pending:
+                escape = directive[1]
+            continue
+        if not pending:
+            start = lineno
+        if line.endswith(escape):
+            pending += line[:-1] + ' '
+            continue
+        line = pending + line
+        pending = ''
+        match = re.match(r'([A-Za-z]+)\s+(.*)', line)
+        if not match:
+            continue
+        instruction, value = match[1].upper(), match[2]
+        if instruction in ('RUN', 'COPY', 'ADD'):
+            heredocs = [(m[3], bool(m[1])) for m in re.finditer(
+                r'''(?:^|\s)<<(-?)(["']?)([A-Za-z_][A-Za-z0-9_]*)\2(?=\s|$)''', value)]
+        yield start, instruction, value
+
+
+def _scan_dockerfile(text, rel, add):
+    instructions = list(_docker_instructions(text))
+    if not any(op == 'USER' for _, op, _ in instructions):
+        add('config', 'low', rel, None,
+            summary='Dockerfile has no USER instruction (runs as root)',
+            evidence='no USER directive')
+    stages = set()
+    final_user = None
+    for lineno, op, value in instructions:
+        if op == 'FROM':
+            final_user = None
+        elif op == 'USER':
+            final_user = (lineno, value.strip())
+
+        def finding(severity, summary, evidence):
+            add('config', severity, rel, lineno, summary=summary, evidence=evidence)
+
+        try:
+            words = shlex.split(value)
+        except ValueError:
+            continue
+        if op in ('FROM', 'ADD'):
+            # Dockerfile options precede the operands and use --name=value.
+            operands = re.sub(r'^(?:--\S+\s+)*', '', value)
+            try:
+                words = json.loads(operands) if operands.startswith('[') else shlex.split(operands)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(words, list) or not all(isinstance(w, str) for w in words):
+                continue
+        if op == 'ADD' and any(re.match(r'https?://', w, re.I) for w in words[:-1]):
+            finding('low', 'Dockerfile uses ADD with a remote URL', 'ADD remote URL (value omitted)')
+        elif op == 'FROM' and words:
+            image = words[0]
+            if (image.lower() not in stages and image.lower() != 'scratch' and '$' not in image
+                    and not re.search(r'@sha256:[0-9a-fA-F]{64}$', image)
+                    and (':' not in image.rsplit('/', 1)[-1] or image.endswith(':latest'))):
+                finding('low', 'Dockerfile base image uses latest (explicit or implicit)',
+                        'FROM unversioned image or :latest (value omitted)')
+            if len(words) == 3 and words[1].upper() == 'AS':
+                stages.add(words[2].lower())
+        elif op in ('ENV', 'ARG') and words:
+            if op == 'ENV' and '=' not in words[0]:
+                assignments = [(words[0], ' '.join(words[1:]))]
+            else:
+                assignments = [w.split('=', 1) for w in words if '=' in w]
+            for name, assigned in assignments:
+                if (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name)
+                        and re.search(r'(?:^|_)(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|'
+                                      r'PRIVATE_KEY|SECRET_KEY|SECRET_ACCESS_KEY)$', name, re.I)
+                        and assigned and not re.fullmatch(r'\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\}', assigned)):
+                    finding('high', 'Dockerfile %s assigns secret-like variable %s' % (op, name), name + '=…')
+        elif op == 'RUN' and not value.startswith('['):
+            try:
+                lexer = shlex.shlex(value, posix=True, punctuation_chars='|;&')
+                lexer.whitespace_split = True
+                tokens = list(lexer)
+            except ValueError:
+                continue
+            command = []
+            for index, token in enumerate(tokens):
+                if token == '|' and command and index + 1 < len(tokens):
+                    if (os.path.basename(command[0]) == 'curl'
+                            and os.path.basename(tokens[index + 1]) in ('sh', 'bash')):
+                        finding('medium', 'Dockerfile RUN pipes curl output to a shell', 'curl | shell')
+                        break
+                if re.fullmatch(r'[|;&]+', token):
+                    command = []
+                else:
+                    command.append(token)
+
+    if final_user and re.fullmatch(r'(?:root|0)(?::[A-Za-z0-9_.-]+)?', final_user[1]):
+        add('config', 'low', rel, final_user[0],
+            summary='Dockerfile final USER explicitly runs as root',
+            evidence='USER root or UID 0 (value omitted)')
 
 
 # ---------------------------------------------------------------- triage
@@ -641,7 +976,7 @@ def _secret_false_positive(f):
     return False, None
 
 
-def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0):
+def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0, config_review=0):
     parts = []
     if up:
         parts.append("%d dependency advisory/ies fixable by upgrade" % up)
@@ -653,14 +988,18 @@ def _triage_headline(up, mon, sec_review, sec_fp, scaffold=0):
         parts.append("%d secret hit(s) needing review" % sec_review)
     if sec_fp:
         parts.append("%d secret hit(s) classified likely-false-positive" % sec_fp)
+    if config_review:
+        parts.append("%d configuration finding(s) needing review" % config_review)
     return "; ".join(parts) if parts else "no actionable findings after triage"
 
 
 def triage_findings(findings):
     """Deterministic interpretation of the raw findings. Returns (per_id, summary)."""
     per_id = {}
+    by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     dep_upgrade = dep_monitor = dep_scaffold = 0
     sec_total = sec_fp = 0
+    config_review = 0
     for f in findings:
         cat = f["category"]
         t = {}
@@ -704,13 +1043,19 @@ def triage_findings(findings):
                               "if real, rotate it and purge it from history.")}
         else:  # config / other
             t = {"action": "review"}
+            if cat == "config":
+                config_review += 1
         per_id[f["id"]] = t
+        by_action[t["action"]] += 1
     summary = {
+        "by_action": by_action,
         "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
                        "in_scaffold_lockfiles": dep_scaffold},
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
-        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp, dep_scaffold),
+        "config": {"needs_review": config_review},
+        "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
+                                     dep_scaffold, config_review),
     }
     return per_id, summary
 
@@ -726,12 +1071,18 @@ def git_head(path):
 
 
 def main(argv):
+    ERRORS.clear()
+    PARSED_LOCKFILES.clear()
     args = argv[1:]
+    if args == ["--version"]:
+        print(SCANNER + " " + VERSION)
+        return 0
     if not args or args[0] in ("-h", "--help"):
         print(__doc__.strip())
         return 0
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
+    compact = False
     i = 1
     while i < len(args):
         if args[i] == "--json" and i + 1 < len(args):
@@ -742,6 +1093,9 @@ def main(argv):
             i += 1
         elif args[i] == "--triage":
             triage = True
+            i += 1
+        elif args[i] == "--compact":
+            compact = True
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
@@ -754,8 +1108,13 @@ def main(argv):
             return 2
     if re.match(r"^(https?|git)://|^git@", target):
         root = tempfile.mkdtemp(prefix="fds-clone-")
-        r = subprocess.run(["git", "clone", "--depth", "1", target, root],
-                           capture_output=True, text=True, timeout=600)
+        try:
+            clone_timeout = max(1, int(os.environ.get("FDS_CLONE_TIMEOUT", "600")))
+        except ValueError:
+            clone_timeout = 600
+        env = dict(os.environ, GIT_LFS_SKIP_SMUDGE="1")
+        r = subprocess.run(["git", "-c", "core.symlinks=false", "clone", "--depth", "1", target, root],
+                           capture_output=True, text=True, timeout=clone_timeout, env=env)
         if r.returncode != 0:
             sys.stderr.write(r.stderr[-2000:])
             return 3
@@ -765,11 +1124,21 @@ def main(argv):
             sys.stderr.write("not a directory: %s\n" % root)
             return 2
 
-    files = sorted(walk(root))
+    skipped = {"non_regular": 0}
+    candidate_files = sorted(islice(walk(root, skipped), MAX_FILES + 1))
+    files_truncated = len(candidate_files) > MAX_FILES
+    files = candidate_files[:MAX_FILES]
     findings = []
+    findings_per_file = {}
+    findings_truncated = False
 
     def add(category, severity, file, line, summary, evidence,
             package=None, ecosystem=None, version=None, vuln_ids=None, fixed_in=None):
+        nonlocal findings_truncated
+        if len(findings) >= MAX_FINDINGS or findings_per_file.get(file, 0) >= MAX_FINDINGS_PER_FILE:
+            findings_truncated = True
+            return
+        findings_per_file[file] = findings_per_file.get(file, 0) + 1
         findings.append({
             "id": None, "category": category, "severity": severity, "file": file,
             "line": line, "package": package, "ecosystem": ecosystem, "version": version,
@@ -809,9 +1178,34 @@ def main(argv):
                                  f["category"], f["file"] or "", f["line"] or 0,
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
+    by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
+    by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
+    highest_severity_by_file = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
+        by_category[f["category"]] = by_category.get(f["category"], 0) + 1
+        # Findings are already sorted from highest to lowest severity.
+        highest_severity_by_file.setdefault(f["file"], f["severity"])
+        counts = by_category_severity.setdefault(f["category"], dict.fromkeys(by_sev, 0))
+        counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+
+    packages_by_ecosystem = {}
+    for ecosystem, _, _ in sorted(pkgs):
+        packages_by_ecosystem[ecosystem] = packages_by_ecosystem.get(ecosystem, 0) + 1
+
+    vulnerable_packages_by_ecosystem = {}
+    for ecosystem, _, _ in sorted(vulnerable):
+        vulnerable_packages_by_ecosystem[ecosystem] = vulnerable_packages_by_ecosystem.get(ecosystem, 0) + 1
+
+    packages_by_manifest = dict.fromkeys(sorted(PARSED_LOCKFILES), 0)
+    for manifest in pkgs.values():
+        packages_by_manifest[manifest] += 1
+
+    packages_by_path_context = {"scaffold": 0, "other": 0}
+    for manifest in pkgs.values():
+        context = "scaffold" if TEST_PATH_RE.search(manifest) else "other"
+        packages_by_path_context[context] += 1
 
     commit = git_head(root)
     doc = {
@@ -819,21 +1213,59 @@ def main(argv):
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "files_scanned": len(files),
+            "files_with_findings": len({f["file"] for f in findings}),
+            "findings_by_file": dict(sorted(findings_per_file.items())),
+            "files_with_findings_by_category": {
+                category: len({f["file"] for f in findings if f["category"] == category})
+                for category in by_category
+            },
+            "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
+            "packages_by_ecosystem": packages_by_ecosystem,
+            "packages_by_path_context": packages_by_path_context,
+            "packages_by_manifest": packages_by_manifest,
             "vulnerable_packages": len(vulnerable),
+            "dependency_findings_with_fixes": sum(
+                1 for f in findings if f["category"] == "dependency-vuln" and f["fixed_in"]),
+            "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
+            "unique_advisories": len({vid for f in findings
+                                      if f["category"] == "dependency-vuln"
+                                      for vid in f["vuln_ids"]}),
+            "osv_enabled": use_osv,
+            "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "by_severity": by_sev,
+            "highest_severity": findings[0]["severity"] if findings else None,
+            "highest_severity_by_file": dict(sorted(highest_severity_by_file.items())),
+            "by_category": by_category,
+            "by_category_severity": by_category_severity,
             "lockfiles_parsed": sorted(PARSED_LOCKFILES),
+            "limits": {"files": MAX_FILES, "findings": MAX_FINDINGS,
+                       "findings_per_file": MAX_FINDINGS_PER_FILE},
+            "truncated": {"findings": findings_truncated, "files": files_truncated},
         },
         "findings": findings,
     }
+    gate_matches = 0
+    if fail_on is not None:
+        gate_matches = sum(1 for f in findings
+                           if SEV_ORDER.get(f["severity"], 99) <= SEV_ORDER[fail_on])
+        doc["summary"]["gate"] = {
+            "threshold": fail_on,
+            "matching_findings": gate_matches,
+            "passed": gate_matches == 0,
+        }
     if not PARSED_LOCKFILES:
         # a zero must not read as "clean" (dataset 2026-10-08: 3 of 25 repos scanned 0 packages)
         doc["summary"]["notes"] = [
             "No supported dependency manifest was parsed, so dependency advisories were NOT assessed. "
             "Supported: package-lock.json, yarn.lock (v1 + Berry), pnpm-lock.yaml, poetry.lock, uv.lock, "
             "Cargo.lock, Gemfile.lock, go.mod (go.sum only without go.mod), requirements*.txt."]
+    if findings_truncated or files_truncated:
+        doc["summary"].setdefault("notes", []).append(
+            "Scan limits reached; results were truncated at the file or finding limit. "
+            "Review the summary.truncated flags.")
     canon = json.dumps({"findings": findings, "target": target, "commit": commit},
                        sort_keys=True, separators=(",", ":"))
     doc["manifest_hash"] = hashlib.sha256(canon.encode()).hexdigest()
@@ -843,8 +1275,8 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    text = json.dumps(doc, indent=2)
-    if out_path:
+    text = json.dumps(doc, separators=(",", ":")) if compact else json.dumps(doc, indent=2)
+    if out_path and out_path != "-":
         with open(out_path, "w") as fh:
             fh.write(text + "\n")
         sys.stderr.write("wrote %s (%d findings)\n" % (out_path, len(findings)))

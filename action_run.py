@@ -4,6 +4,7 @@ variables (never from shell interpolation), runs the scanner, writes the
 GitHub step outputs and a Markdown step summary, and applies the severity gate.
 Runs anywhere: if GITHUB_OUTPUT / GITHUB_STEP_SUMMARY are unset it prints instead."""
 import json
+import html
 import os
 import re
 import subprocess
@@ -11,6 +12,14 @@ import sys
 
 SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 MAX_ROWS = 50
+
+
+def markdown_text(value):
+    """Render report data as one inert Markdown text span."""
+    value = html.escape(re.sub(r"\s+", " ", str(value)), quote=False)
+    for char in "\\`|[]!*_":
+        value = value.replace(char, "&#%d;" % ord(char))
+    return value
 
 
 def out(name, value):
@@ -51,7 +60,7 @@ def triage_cell(t):
             cell = "upgrade to %s" % " / ".join(fixed[:3])
         else:
             cell = "upgrade (see report)"
-        return cell.replace("|", "\\|")
+        return cell
     if action == "monitor":
         return "no patch yet: monitor/mitigate"
     if t.get("likely_false_positive"):
@@ -97,15 +106,16 @@ def main():
           "**%d finding(s)** — " % len(findings)
           + ", ".join("%s: %d" % (k, by_sev.get(k, 0)) for k in ("critical", "high", "medium", "low", "unknown"))
           + "\n\n",
-          "Scanned %d files, %d packages (%d with advisories). Commit `%s`. Report: `%s`. Manifest hash `%s`.\n\n" % (
+          "Scanned %d files, %d packages (%d with advisories). Commit %s. Report: %s. Manifest hash %s.\n\n" % (
               (doc.get("summary") or {}).get("files_scanned", 0),
               (doc.get("summary") or {}).get("packages_found", 0),
               (doc.get("summary") or {}).get("vulnerable_packages", 0),
-              (doc.get("commit") or "")[:12], report, (doc.get("manifest_hash") or "")[:16])]
+              markdown_text((doc.get("commit") or "")[:12]), markdown_text(report),
+              markdown_text((doc.get("manifest_hash") or "")[:16]))]
     if use_triage and tsum:
         dep = tsum.get("dependency") or {}
         sec = tsum.get("secrets") or {}
-        md.append("**Triage:** %s\n\n" % (tsum.get("headline") or ""))
+        md.append("**Triage:** %s\n\n" % markdown_text(tsum.get("headline") or ""))
         md.append("Fix by upgrade: %d · no patch yet (monitor): %d · secret hits to review: %d · likely false positive: %d\n\n" % (
             dep.get("upgradeable", 0), dep.get("monitor_only", 0),
             sec.get("needs_review", 0), sec.get("likely_false_positive", 0)))
@@ -118,14 +128,19 @@ def main():
             loc = f.get("file") or ""
             if f.get("line"):
                 loc += ":%s" % f["line"]
-            row = "| %s | %s | %s | `%s` | %s |" % (
-                f["id"], f["severity"], f["category"], loc.replace("|", "\\|"),
-                (f.get("summary") or "").replace("|", "\\|")[:160])
+            row = "| %s | %s | %s | %s | %s |" % (
+                markdown_text(f["id"]), markdown_text(f["severity"]),
+                markdown_text(f["category"]), markdown_text(loc),
+                markdown_text((f.get("summary") or "")[:160]))
             if use_triage:
-                row += " %s |" % triage_cell(triage.get(f["id"]) or {})
+                row += " %s |" % markdown_text(triage_cell(triage.get(f["id"]) or {}))
             md.append(row + "\n")
         if len(findings) > MAX_ROWS:
             md.append("\n…and %d more in the JSON report.\n" % (len(findings) - MAX_ROWS))
+    if not use_osv:
+        md.append("\n**Dependency advisory lookup skipped:** OSV is disabled for this run.\n")
+    if (doc.get("summary") or {}).get("notes"):
+        md.append("\n**Dependency coverage incomplete:** see `summary.notes` and `summary.lockfiles_parsed` in the report.\n")
     if doc.get("errors"):
         md.append("\n**Degraded:** %d lookup error(s); see `errors` in the report.\n" % len(doc["errors"]))
     md.append("\n<sub>Deterministic scan by <a href=\"https://github.com/project-feldspar-resources/feldspar-scan\">feldspar-scan</a> "

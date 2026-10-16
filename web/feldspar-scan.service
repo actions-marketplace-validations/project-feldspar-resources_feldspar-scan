@@ -24,6 +24,8 @@ PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=/home/feldspar/workspace/projects/e5-api/scanner
+# PRO-96 W-1 (2026-10-13): the online cancellation function's record (CANCEL_LOG); create the directory as the service user first.
+ReadWritePaths=/home/feldspar/work/cancellations
 
 [Install]
 WantedBy=multi-user.target

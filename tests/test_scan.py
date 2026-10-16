@@ -15,7 +15,10 @@ silently undo them:
   * summary.lockfiles_parsed / summary.notes, manifest_hash determinism, --triage additivity and
     the --fail-on gate on the committed test_fixture.
 """
+import base64
+import contextlib
 import hashlib
+import io
 import importlib.util
 import json
 import os
@@ -23,6 +26,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -60,6 +64,43 @@ def _collect(root, fn):
 
     fn(root, sorted(scan.walk(root)), add)
     return out
+
+
+class AdvisorySummaryTests(unittest.TestCase):
+    def test_osv_mode_is_explicit_with_and_without_packages(self):
+        for has_packages in (False, True):
+            with self.subTest(has_packages=has_packages), tempfile.TemporaryDirectory() as root:
+                if has_packages:
+                    with open(os.path.join(root, "requirements.txt"), "w") as fh:
+                        fh.write("demo-package==1.2.3\n")
+                results = []
+                for enabled in (False, True):
+                    stdout = io.StringIO()
+                    args = ["scan.py", root] + ([] if enabled else ["--no-osv"])
+                    with mock.patch.object(scan, "query_osv", return_value={}) as query, \
+                            contextlib.redirect_stdout(stdout):
+                        self.assertEqual(scan.main(args), 0)
+                    result = json.loads(stdout.getvalue())
+                    self.assertIs(result["summary"]["osv_enabled"], enabled)
+                    self.assertEqual(result["summary"]["packages_found"], int(has_packages))
+                    self.assertEqual(result["summary"]["vulnerable_packages"], 0)
+                    self.assertEqual(query.call_count, int(enabled and has_packages))
+                    results.append(result)
+                self.assertEqual(results[0]["findings"], results[1]["findings"])
+                self.assertEqual(results[0]["manifest_hash"], results[1]["manifest_hash"])
+
+    def test_enabled_does_not_claim_successful_lookup(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "requirements.txt"), "w") as fh:
+                fh.write("demo-package==1.2.3\n")
+            stdout = io.StringIO()
+            with mock.patch.object(scan, "http_json", side_effect=OSError("offline fixture")), \
+                    contextlib.redirect_stdout(stdout):
+                self.assertEqual(scan.main(["scan.py", root]), 0)
+            result = json.loads(stdout.getvalue())
+            self.assertIs(result["summary"]["osv_enabled"], True)
+            self.assertTrue(result["errors"])
+            self.assertEqual(result["summary"]["vulnerable_packages"], 0)
 
 
 # ------------------------------------------------------------- value hints
@@ -199,6 +240,72 @@ class ScanSecretsTests(unittest.TestCase):
         f = self._one("keys/id_rsa")
         self.assertEqual((f["severity"], f["summary"]), ("critical", "Private key block detected"))
 
+    def _pem_block(self, label="RSA PRIVATE KEY", body=None, footer=None):
+        # Base64 of plain text, never key material or a functional private key.
+        if body is None:
+            encoded = base64.b64encode(b"Not a key; synthetic bytes 0123456789. " * 4).decode()
+            body = "\n".join(encoded[i:i + 64] for i in range(0, len(encoded), 64))
+        return "-----BEGIN %s-----\n%s\n-----END %s-----\n" % (
+            label, body, footer or label)
+
+    def _scan_pem(self, text):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "key.pem"), "w") as fh:
+                fh.write(text)
+            return _collect(root, scan.scan_secrets)
+
+    def test_complete_multiline_private_key_labels_and_redaction(self):
+        for label in ("PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY",
+                      "OPENSSH PRIVATE KEY", "DSA PRIVATE KEY", "PGP PRIVATE KEY",
+                      "ENCRYPTED PRIVATE KEY", "CUSTOM LABEL PRIVATE KEY"):
+            with self.subTest(label=label):
+                block = self._pem_block(label)
+                findings = self._scan_pem("configuration\n" + block)
+                self.assertEqual(len(findings), 1, findings)
+                f = findings[0]
+                self.assertEqual((f["severity"], f["line"], f["summary"]),
+                                 ("critical", 2, "Multiline private key block detected"))
+                self.assertEqual(f["evidence"], "----…")
+                self.assertFalse(scan._secret_false_positive(f)[0])
+                self.assertNotIn(block.splitlines()[1], json.dumps(findings))
+
+    def test_complete_private_key_placeholder_bodies_are_low(self):
+        for body, hint in (("...", "placeholder?"), ("YOUR_KEY_HERE", "placeholder?"),
+                           ("REDACTED", "word-like?"), ("xxxx", "placeholder?"),
+                           ("00000000", "example-key?"), ("****", "example-key?"),
+                           ("AKIAIOSFODNN7EXAMPLE", "example-key?")):
+            for count in (1, 3):
+                with self.subTest(body=body, lines=count):
+                    findings = self._scan_pem(self._pem_block(body="\n".join([body] * count)))
+                    blocks = [f for f in findings if "private key block" in f["summary"]]
+                    self.assertEqual(len(blocks), 1, findings)
+                    self.assertEqual(blocks[0]["severity"], "low")
+                    # Six or more x's use the existing fixed-pattern mask hint.
+                    expected = "example-key?" if body == "xxxx" and count == 3 else hint
+                    self.assertEqual(blocks[0]["evidence"], "----… (%s)" % expected)
+                    self.assertTrue(scan._secret_false_positive(blocks[0])[0])
+
+    def test_multiline_private_key_requires_matching_footer_and_body(self):
+        body = self._pem_block().splitlines()[1:]
+        cases = [self._pem_block(footer="EC PRIVATE KEY"),
+                 self._pem_block().rsplit("-----END", 1)[0],
+                 self._pem_block(body=body[0]),
+                 self._pem_block(body="A1B2\nC3D4\ninvalid!"),
+                 self._pem_block(body=""),
+                 "-----BEGIN RSA PRIVATE KEY-----\n"]
+        for text in cases:
+            with self.subTest(text=text):
+                findings = self._scan_pem(text)
+                self.assertFalse(any(f["summary"].startswith("Multiline") for f in findings))
+
+    def test_multiple_private_key_blocks_and_crlf(self):
+        text = self._pem_block() + "gap\n" + self._pem_block("EC PRIVATE KEY")
+        findings = self._scan_pem(text.replace("\n", "\r\n"))
+        self.assertEqual(len(findings), 2, findings)
+        self.assertEqual([f["line"] for f in findings], [1, 8])
+        self.assertTrue(all(f["summary"] == "Multiline private key block detected"
+                            for f in findings))
+
     def test_minified_js_is_skipped(self):
         self.assertNotIn("lib/vendor.min.js", self.by_file)
 
@@ -210,6 +317,105 @@ class ScanSecretsTests(unittest.TestCase):
             self.assertLessEqual(len(ev), 5, f)
         self.assertNotIn("sk-9f8e7d6c", json.dumps(self.findings))
         self.assertNotIn("AKIAIOSFODNN7EXAMPLE", json.dumps(self.findings))
+
+    def test_provider_patterns_and_downgrades(self):
+        cases = [
+            ("GitLab personal access token", "high", "glpat-" + "aB3dE6gH9_-kL2nP5qR8",
+             "glpat-" + "x" * 20),
+            ("npm access token", "high", "npm_" + "aB3dE6gH9jK2" * 3,
+             "npm_" + "x" * 36),
+            ("OpenAI API key", "high", "sk-" + "aB3dE6gH9jK2" * 4,
+             "sk-" + "x" * 48),
+            ("OpenAI API key", "high", "sk-proj-" + "aB3dE6gH9_-K2" * 12,
+             "sk-proj-" + "x" * 156),
+            ("Anthropic API key", "high", "sk-ant-api03-" + "aB3dE6gH9_-K2" * 7,
+             "sk-ant-api03-" + "x" * 91),
+            ("Hugging Face token", "medium", "hf_" + "aB3dE6gH9jK2" * 2 + "mN4pQ7sT0v",
+             "hf_" + "x" * 34),
+            ("SendGrid API key", "high", "SG." + "aB3dE6gH9_-" * 2 + "." + "kL2nP5qR8_-" * 3 + "sT0vW3yZ6a",
+             "SG." + "x" * 22 + "." + "x" * 43),
+            ("Telegram bot token", "high", "123456789:" + "aB3dE6gH9_-" * 3 + "kL",
+             "123456789:" + "x" * 35),
+            ("Twilio API key SID", "medium", "SK" + "a1B2c3D4e5F60789" * 2,
+             "SK" + "0" * 32),
+        ]
+        for description, severity, value, masked in cases:
+            variants = [
+                (value, severity, None),
+                (masked, "low", "example-key?"),
+                ('<input placeholder="' + value + '">', "low", "form-placeholder?"),
+            ]
+            for text, want_severity, hint in variants:
+                with self.subTest(provider=description, prefix=value[:12], hint=hint):
+                    root = _tree({"src/credentials.txt": text + "\n"})
+                    findings = _collect(root, scan.scan_secrets)
+                    self.assertEqual(len(findings), 1, findings)
+                    f = findings[0]
+                    self.assertEqual(f["summary"], description + " detected")
+                    self.assertEqual(f["severity"], want_severity)
+                    if hint:
+                        self.assertIn("(%s)" % hint, f["evidence"])
+                    else:
+                        self.assertNotIn("(?)", f["evidence"])
+                        self.assertEqual(f["evidence"], value[:4] + "…")
+                    self.assertNotIn(value, json.dumps(findings))
+
+    def test_aws_key_rejects_identifier_substrings(self):
+        value = "AKIA" + "A1B2C3D4E5F6G7H8"  # synthetic, never authenticated
+        for adjacent in ("A", "z", "0", "_"):
+            for text in (adjacent + value, value + adjacent):
+                with self.subTest(text=text):
+                    with tempfile.TemporaryDirectory() as root:
+                        path = os.path.join(root, "settings.txt")
+                        with open(path, "w") as fh:
+                            fh.write(text + "\n")
+                        self.assertEqual(_collect(root, scan.scan_secrets), [])
+
+    def test_aws_key_boundaries_preserve_delimited_findings(self):
+        value = "AKIA" + "A1B2C3D4E5F6G7H8"
+        for text in (value, '"' + value + '"', "'" + value + "'",
+                     "[" + value + "]", "id=" + value + "&region=test",
+                     " " + value + " ", "prefix-" + value + "-suffix"):
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory() as root:
+                    path = os.path.join(root, "settings.txt")
+                    with open(path, "w") as fh:
+                        fh.write("# synthetic fixture\n" + text + "\n")
+                    findings = _collect(root, scan.scan_secrets)
+                    self.assertEqual(len(findings), 1, findings)
+                    hit = findings[0]
+                    self.assertEqual(hit["summary"], "AWS access key ID detected")
+                    self.assertEqual(hit["severity"], "high")
+                    self.assertEqual(hit["line"], 2)
+                    self.assertEqual(hit["evidence"], "AKIA…")
+                    self.assertNotIn(value, json.dumps(findings))
+
+    def test_provider_patterns_reject_short_or_malformed_values(self):
+        values = [
+            "glpat-" + "aB3dE6gH9" * 2,  # 18 characters
+            "glpat-" + "a" * 21,
+            "npm_" + "a" * 35,
+            "npm_" + "a" * 37,
+            "sk-short", "sk-" + "a" * 39, "sk-proj-" + "a" * 39,
+            "sk-ant-" + "a" * 39,
+            "hf_" + "a" * 33,
+            "SG.short.segments",
+            "123456789:" + "a" * 34,
+            "123456789:" + "a" * 36,
+            "SK" + "a" * 31, "SK" + "a" * 33, "SK" + "g" * 32,
+            "sk_test_" + "aB3dE6gH9" * 6,
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                root = _tree({"src/credentials.txt": value + "\n"})
+                self.assertEqual(_collect(root, scan.scan_secrets), [])
+
+    def test_stripe_live_key_is_not_also_openai(self):
+        root = _tree({"src/credentials.txt": "sk_live_" + "aB3dE6gH9" * 6 + "\n"})
+        findings = _collect(root, scan.scan_secrets)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["summary"], "Stripe live secret key detected")
+        self.assertEqual(findings[0]["severity"], "critical")
 
 
 # ----------------------------------------------------------------- triage
@@ -312,6 +518,43 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(sorted(pkgs), [("Go", "github.com/a/b", "v1.0.0")])
         self.assertEqual(scan.PARSED_LOCKFILES, ["go.sum"])
 
+    def test_go_sum_skips_incomplete_or_extra_fields(self):
+        text = ("example.com/good v1.2.3 h1:abc=\n"
+                "example.com/missing-hash v2.0.0\n"
+                "example.com/extra v3.0.0 h1:abc= trailing\n"
+                "example.com/bad-hash v4.0.0 invalid\n")
+        self.assertEqual(scan.parse_go_sum(text), [("Go", "example.com/good", "v1.2.3")])
+
+    def test_go_mod_skips_extra_fields_inside_require_block(self):
+        text = ("require (\n"
+                "  example.com/bad v1.2.3 unexpected\n"
+                "  example.com/good v2.3.4 // indirect\n"
+                ")\n"
+                "require example.com/also-good v3.4.5\n")
+        self.assertEqual(scan.parse_go_mod(text),
+                         [("Go", "example.com/good", "v2.3.4"),
+                          ("Go", "example.com/also-good", "v3.4.5")])
+
+    def test_go_mod_skips_malformed_require_block_opener(self):
+        text = ("require (unexpected\n"
+                "  example.com/bad v1.2.3\n"
+                ")\n"
+                "require (\n"
+                "  example.com/good v2.3.4\n"
+                ")\n")
+        self.assertEqual(scan.parse_go_mod(text),
+                         [("Go", "example.com/good", "v2.3.4")])
+
+    def test_gemfile_ignores_git_and_path_specs(self):
+        text = ("GIT\n  remote: https://example.invalid/repo.git\n  specs:\n"
+                "    git-gem (1.0.0)\n\n"
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n"
+                "    registry-gem (2.0.0)\n\n"
+                "PATH\n  remote: ../local\n  specs:\n"
+                "    local-gem (3.0.0)\n")
+        self.assertEqual(scan.parse_gemfile_lock(text),
+                         [("RubyGems", "registry-gem", "2.0.0")])
+
     def test_yarn_v1_and_berry(self):
         v1 = 'lodash@^4.17.0, lodash@^4.17.15:\n  version "4.17.21"\n  resolved "x"\n'
         self.assertEqual(scan.parse_yarn_lock(v1), [("npm", "lodash", "4.17.21")])
@@ -329,6 +572,29 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(scan.parse_yarn_lock('"@babel/core@^7.0.0", "@babel/core@^7.1.0":\n  version "7.1.2"\n'),
                          [("npm", "@babel/core", "7.1.2")])
 
+    def test_yarn_skips_truncated_version_and_continues(self):
+        text = ('broken@^1:\n  version "1.2.3\n'
+                'also-broken@^2:\n  version: 2.0.0 trailing\n'
+                'good@^3:\n  version "3.0.0"\n'
+                'berry@npm:^4:\n  version: 4.0.0\n')
+        self.assertEqual(scan.parse_yarn_lock(text),
+                         [("npm", "good", "3.0.0"), ("npm", "berry", "4.0.0")])
+
+    def test_pnpm_skips_truncated_quoted_keys_and_continues(self):
+        text = ("packages:\n"
+                "  'missing-close@1.0.0:\n"
+                "  missing-open@2.0.0':\n"
+                "  'quoted@3.0.0':\n"
+                "  plain@4.0.0:\n")
+        self.assertEqual(scan.parse_pnpm_lock(text),
+                         [("npm", "quoted", "3.0.0"), ("npm", "plain", "4.0.0")])
+
+    def test_yarn_malformed_header_does_not_reuse_previous_name(self):
+        text = ('stale@^1:\n  resolved "unused"\n'
+                'malformed@^2\n  version "2.0.0"\n'
+                'good@^3:\n  version "3.0.0"\n')
+        self.assertEqual(scan.parse_yarn_lock(text), [("npm", "good", "3.0.0")])
+
     def test_requirements_and_package_lock(self):
         self.assertEqual(scan.parse_requirements("requests==2.31.0  # pinned\nflask>=2\n-e .\n"
                                                  "urllib3[socks]==1.26.5; python_version<'3'\n"),
@@ -339,6 +605,16 @@ class LockfileTests(unittest.TestCase):
         self.assertEqual(sorted(scan.parse_package_lock(lock)),
                          [("npm", "b", "1.0.0"), ("npm", "lodash", "4.17.20")])
 
+    def test_package_lock_with_utf8_bom_is_collected(self):
+        lock = '{"packages":{"node_modules/demo":{"version":"1.2.3"}}}'
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "package-lock.json")
+            with open(path, "wb") as fh:
+                fh.write(b"\xef\xbb\xbf" + lock.encode("utf-8"))
+            self.assertEqual(scan.collect_packages(root, [path]),
+                             {("npm", "demo", "1.2.3"): "package-lock.json"})
+        self.assertEqual(scan.parse_package_lock("\ufeff" + lock[:-1]), [])
+
     def test_scaffold_lockfile_attribution(self):
         """A package@version listed by both a shipped and a fixture lockfile is attributed to the shipped one."""
         lock = json.dumps({"packages": {"node_modules/react": {"version": "18.2.0"}}})
@@ -348,6 +624,136 @@ class LockfileTests(unittest.TestCase):
         root = _tree({"examples/demo/package-lock.json": lock})
         pkgs = scan.collect_packages(root, sorted(scan.walk(root)))
         self.assertEqual(pkgs[("npm", "react", "18.2.0")], "examples/demo/package-lock.json")
+
+
+class MalformedManifestTests(unittest.TestCase):
+    # Exercise every registered format, including all three TOML ecosystems.
+    VALID = {
+        "requirements.txt": ('demo==1.2.3\n', [("PyPI", "demo", "1.2.3")]),
+        "poetry.lock": ('[[package]]\nname="demo"\nversion="1.2.3"\n',
+                        [("PyPI", "demo", "1.2.3")]),
+        "uv.lock": ('[[package]]\nname="demo"\nversion="1.2.3"\n',
+                    [("PyPI", "demo", "1.2.3")]),
+        "Cargo.lock": ('[[package]]\nname="demo"\nversion="1.2.3"\n',
+                       [("crates.io", "demo", "1.2.3")]),
+        "package-lock.json": ('{"dependencies":{"demo":{"version":"1.2.3"}}}',
+                              [("npm", "demo", "1.2.3")]),
+        "yarn.lock": ('demo@^1.2.3:\n  version "1.2.3"\n', [("npm", "demo", "1.2.3")]),
+        "pnpm-lock.yaml": ('packages:\n  demo@1.2.3:\n    resolution: {}\n',
+                           [("npm", "demo", "1.2.3")]),
+        "go.sum": ('example.com/demo v1.2.3 h1:abc=\n', [("Go", "example.com/demo", "v1.2.3")]),
+        "go.mod": ('require example.com/demo v1.2.3\n', [("Go", "example.com/demo", "v1.2.3")]),
+        "Gemfile.lock": ('GEM\n  specs:\n    demo (1.2.3)\n', [("RubyGems", "demo", "1.2.3")]),
+    }
+
+    def test_all_parsers_malformed_and_valid(self):
+        self.assertEqual(set(self.VALID), set(scan.DEP_HANDLERS))
+        junk = ["", "\x00\xff\xfe", "unfinished\"", "[broken: {", "x" * (1024 * 1024),
+                "[" * 2000 + "]" * 2000]
+        for filename, (valid, expected) in self.VALID.items():
+            handler = scan.DEP_HANDLERS[filename]
+            with self.subTest(filename=filename, case="valid"):
+                self.assertEqual(handler(valid), expected)
+            for i, text in enumerate(junk):
+                with self.subTest(filename=filename, case=i):
+                    self.assertEqual(handler(text), [])
+            with self.subTest(filename=filename, case="valid prefix then junk"):
+                structured = filename == "package-lock.json" or (
+                    filename in ("poetry.lock", "uv.lock", "Cargo.lock") and scan.tomllib)
+                self.assertEqual(handler(valid + "\n[broken: {"), [] if structured else expected)
+
+    def test_truncated_tokens(self):
+        cases = {
+            "requirements.txt": "demo==",
+            "poetry.lock": '[[package]]\nname="demo"\nversion="',
+            "uv.lock": '[[package]]\nname="demo"\nversion="',
+            "Cargo.lock": '[[package]]\nname="demo"\nversion="',
+            "package-lock.json": '{"dependencies":{"demo":{"version":"',
+            "yarn.lock": 'demo@^1:\n  version "',
+            "pnpm-lock.yaml": "packages:\n  'demo@",
+            "go.sum": "example.com/demo",
+            "go.mod": "require example.com/demo",
+            "Gemfile.lock": "GEM\n  specs:\n    demo (",
+        }
+        for filename, text in cases.items():
+            with self.subTest(filename=filename):
+                self.assertEqual(scan.DEP_HANDLERS[filename](text), [])
+
+    def test_package_lock_invalid_shapes_and_limits(self):
+        for text in ['null', '[]', '42', '"text"', '{"packages": [null]}',
+                     '{"dependencies": {"demo": null}}',
+                     '{"packages":{"node_modules/demo":{"version":[1]}}}',
+                     '{"dependencies":{"demo":{"version":{"bad":1}}}}',
+                     '{"n":' + '9' * 10000 + '}',
+                     '{"x":' + '[' * 2000 + '0' + ']' * 2000 + '}']:
+            with self.subTest(text=text[:80]):
+                self.assertEqual(scan.parse_package_lock(text), [])
+        nested = '{"version":"1","dependencies":{"child":{"version":"2"}}}'
+        text = '{"dependencies":{"parent":' + nested + ',"sibling":{"version":"3"}}}'
+        self.assertEqual(scan.parse_package_lock(text),
+                         [("npm", "parent", "1"), ("npm", "child", "2"), ("npm", "sibling", "3")])
+
+    def test_package_lock_skips_non_string_versions_without_losing_siblings(self):
+        entries = {
+            "good": {"version": "1.2.3"},
+            "boolean": {"version": True},
+            "number": {"version": 2},
+            "object": {"version": {"bad": 1}},
+            "array": {"version": ["2"]},
+        }
+        for data in (
+            {"packages": {"node_modules/" + name: meta for name, meta in entries.items()}},
+            {"dependencies": entries},
+        ):
+            with self.subTest(format=next(iter(data))):
+                self.assertEqual(scan.parse_package_lock(json.dumps(data)),
+                                 [("npm", "good", "1.2.3")])
+
+    @unittest.skipUnless(scan.tomllib, "requires stdlib TOML decoder")
+    def test_toml_invalid_shapes_and_limits(self):
+        valid = self.VALID["poetry.lock"][0]
+        for text in ['package=1', 'package="bad"', 'package=[1]', '[package]\nname="bad"',
+                     '[[package]]\nname=["bad"]\nversion="1"',
+                     '[[package]]\nname="bad"\nversion={bad=1}',
+                     '[[package]]\nname="bad"\nversion=true',
+                     '[[package]]\nname="bad"\nversion=123',
+                     valid + '[[package]]\nname=["bad"]\nversion="1"',
+                     valid + 'broken="', 'n=' + '9' * 10000,
+                     'n=' + '[' * 2000 + '0' + ']' * 2000]:
+            with self.subTest(text=text[:80]):
+                self.assertEqual(scan.parse_toml_packages(text, "PyPI"), [])
+
+    def test_toml_fallback(self):
+        with mock.patch.object(scan, "tomllib", None):
+            valid, expected = self.VALID["poetry.lock"]
+            self.assertEqual(scan.parse_toml_packages(valid, "PyPI"), expected)
+            self.assertEqual(scan.parse_toml_packages(valid + 'broken="', "PyPI"), expected)
+            self.assertEqual(scan.parse_toml_packages('[[package]]\nname="', "PyPI"), [])
+
+    def test_decoder_logic_errors_are_not_swallowed(self):
+        with mock.patch.object(scan.json, "loads", side_effect=RuntimeError("bug")):
+            with self.assertRaises(RuntimeError):
+                scan.parse_package_lock("{}")
+        if scan.tomllib:
+            with mock.patch.object(scan.tomllib, "loads", side_effect=RuntimeError("bug")):
+                with self.assertRaises(RuntimeError):
+                    scan.parse_toml_packages("", "PyPI")
+
+    def test_bad_files_do_not_abort_collection(self):
+        self.addCleanup(_reset_globals)
+        for raw in [b"\x00\xff\xfe", b"\xff\xfe garbage", b"x" * (8 * 1024 * 1024 + 1)]:
+            with tempfile.TemporaryDirectory() as root:
+                _reset_globals()
+                for i, filename in enumerate(self.VALID):
+                    directory = os.path.join(root, str(i))
+                    os.mkdir(directory)  # keep go.sum separate from go.mod
+                    with open(os.path.join(directory, filename), "wb") as fh:
+                        fh.write(raw)
+                with open(os.path.join(root, "requirements.txt"), "w") as fh:
+                    fh.write("good==1.0\n")
+                self.assertEqual(scan.collect_packages(root, sorted(scan.walk(root))),
+                                 {("PyPI", "good", "1.0"): "requirements.txt"})
+                self.assertEqual(scan.ERRORS, [])
 
 
 # ---------------------------------------------------------------- the CLI
@@ -399,6 +805,16 @@ class CliTests(unittest.TestCase):
     def test_bad_target_and_unknown_arg(self):
         self.assertEqual(_run(os.path.join(ROOT, "does-not-exist"), "--no-osv")[0], 2)
         self.assertEqual(_run(FIXTURE, "--no-osv", "--bogus")[0], 2)
+
+
+class GoSumTruncationTests(unittest.TestCase):
+    def test_empty_hash_and_version_are_skipped(self):
+        text = """example.com/good v1.2.3 h1:abc=
+example.com/empty-hash v2.0.0 h1:
+example.com/empty-version v h1:abc=
+example.com/empty-mod-version v/go.mod h1:abc=
+"""
+        self.assertEqual(scan.parse_go_sum(text), [("Go", "example.com/good", "v1.2.3")])
 
 
 if __name__ == "__main__":
