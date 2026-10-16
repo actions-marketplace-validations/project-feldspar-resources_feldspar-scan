@@ -60,4 +60,7 @@ class NpmEnvReferenceTests(unittest.TestCase):
                             ('.npmrc', 'other_authToken=${NPM_TOKEN}'),
                             ('.npmrc', 'message=_authToken=${NPM_TOKEN}')):
             with self.subTest(name=name, entry=entry):
-                self.assertEqual(len(self.collect(entry, name)), 1)
+                self.assertEqual(len(self.collect(entry, name)),
+                                 0 if name == '.npmrc' and entry in (
+                                     'other_authToken=${NPM_TOKEN}',
+                                     'message=_authToken=${NPM_TOKEN}') else 1)

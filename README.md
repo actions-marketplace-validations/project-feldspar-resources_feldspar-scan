@@ -66,7 +66,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.18
+- uses: project-feldspar-resources/feldspar-scan@v0.4.19
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -84,7 +84,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.18`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.19`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -692,11 +692,12 @@ a credential is live. Test-path rule also widened in v0.4.1: `__fixtures__`, `__
 * `pull_request_target` workflows where an `actions/checkout` step's `with.ref`
   uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
   `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
-* `.npmrc` / `.pypirc` containing `_authToken=` or a `password` line — high.
-  Spaces or tabs before `=` are also accepted for an unscoped or registry-scoped
-  `_authToken` key beginning the line after optional whitespace. The legacy exact
-  `_authToken=` substring check remains; spaced markers inside other option names,
-  values, or trailing comments do not trigger the added whitespace form.
+* `.npmrc` containing an exact unscoped or registry-scoped `_authToken` key
+  followed by `=`, or a `password` line — high. The token key must begin the line
+  after optional whitespace; spaces or tabs before `=` are accepted. Token markers
+  inside other option names, values, or trailing comments do not count.
+  `.pypirc` retains the exact `_authToken=` substring check and the anchored
+  spaced-key form, as well as the `password` rule.
   Empty or whitespace-only `password=` / `password:` fields are ignored;
   later credential lines are still checked. Quoted values and inline comments
   after the delimiter remain nonempty for this conservative heuristic.

@@ -72,7 +72,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.18"
+VERSION = "0.4.19"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -830,8 +830,8 @@ def scan_config(root, files, add):
                     continue  # A standalone environment reference contains no literal credential.
                 if re.fullmatch(r"\s*password\s*[:=]\s*", line, re.I):
                     continue  # An empty password field contains no credential.
-                if ("_authToken=" in line
-                        or re.match(r"^\s*(?://[^\s=]+:)?_authToken[ \t]+=", line)
+                if ((base == ".pypirc" and "_authToken=" in line)
+                        or re.match(r"^\s*(?://[^\s=]+:)?_authToken[ \t]*=", line)
                         or re.match(r"^\s*password\s*[:=]", line, re.I)):
                     add("config", "high", rel, lineno,
                         summary="Credential committed in %s" % base,
