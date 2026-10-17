@@ -41,9 +41,20 @@ The equivalent inline form `--json=PATH` accepts a non-empty path, including
 `--json="report folder/result=a.json"`; equals signs within the path are preserved.
 An empty `--json=` is an argument error (exit 2) before scanning or cloning.
 
+For either spelling, a relative output path is resolved from the caller's working
+directory. For example, `python3 scan.py ./repository --no-osv --json report.json`
+writes `./report.json`, not `./repository/report.json`. Absolute output paths
+select that exact location. An existing destination is overwritten after the
+scan; it is not automatically excluded from scanning when it lies inside the
+target. Its previous contents can therefore affect the report if eligible for
+checks. Save reports outside the target to avoid scanning earlier output.
+
 Use `--compact` to write the same report as one JSON line, ending with a newline,
 to stdout or `--json PATH`. Use `--pretty` to explicitly select the default
-two-space indented JSON; the last `--compact` or `--pretty` flag wins. This changes only
+two-space indented JSON. Use `--indent N` to select zero through eight spaces per
+level (N must be a single ASCII digit `0` through `8`); zero keeps newlines without
+indentation. The last `--compact`, `--pretty`, or `--indent N` flag wins. Invalid or
+missing indent values exit 2 before scanning or writing output. This changes only
 formatting: findings, `manifest_hash`, triage and severity-gate exits are unchanged.
 
 Use `--sort-keys` to alphabetically sort all JSON object keys, including nested
@@ -76,7 +87,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.20
+- uses: project-feldspar-resources/feldspar-scan@v0.4.21
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -94,7 +105,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.20`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.21`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -163,6 +174,14 @@ committed `.env`. All three detectors should fire.
 
 Top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
+
+`commit` is a best-effort lookup of Git `HEAD` at the scan root. Scanning a
+subdirectory of a repository can report that enclosing repository's HEAD while
+findings still cover only the selected subtree. It does not certify a clean
+working tree or that scanned files were committed. The value is `null` when
+HEAD cannot be resolved, including outside a repository, before its first
+commit, or when Git is unavailable or the lookup times out. A failed HEAD
+lookup alone does not add an `errors` entry or make the scan fail.
 
 `summary.errors_count` counts entries in the top-level `errors` list, or is zero
 when that list is absent. It counts recorded errors, not affected packages or
@@ -249,8 +268,13 @@ CLI argument: different spellings of the same path can produce different hashes.
 
 Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
-Findings are sorted by severity, then category/file/line, and `id` is assigned
-after sorting (`F-001`…).
+Findings are sorted by severity (critical, high, medium, low, unknown), then
+category, file, line, package and summary. Missing lines sort as zero; missing
+file/package values sort as empty strings. `id` is assigned after sorting
+(`F-001`…). These IDs identify findings within one report, including keys in
+`triage` when enabled; they are not persistent issue identifiers. Adding or
+removing a finding earlier in the sort order can renumber an unchanged finding.
+Do not join findings across scans using `id` alone.
 
 For a `dependency-vuln` finding, `file` names one representative manifest for
 the unique `(ecosystem, name, version)` entry, not every manifest containing it.
@@ -368,12 +392,18 @@ limits, and no emitted dependency findings produces `{}`, including with
 `--no-osv`. This is not a coverage guarantee. Findings, gates, triage and
 `manifest_hash` are unchanged by this summary.
 
-When `--fail-on` is supplied, `summary.gate` records the normalized `threshold`,
-the number of emitted raw findings at or above it (`matching_findings`), and
+`--fail-on SEV` and `--fail-on=SEV` accept case-insensitive values. When repeated,
+the last value wins across both spellings: `--fail-on HIGH --fail-on=none`
+disables the gate, while `--fail-on=none --fail-on HIGH` enables the high gate.
+An invalid earlier value still exits with code 2; a later valid value does not
+repair an argument error.
+
+When the final `--fail-on` value enables a gate, `summary.gate` records the
+normalized `threshold`, the number of emitted raw findings at or above it (`matching_findings`), and
 `passed` (true when that count is zero). `unknown` never matches a threshold;
 `--triage` does not change the gate. The field is omitted without `--fail-on`
-and does not affect `manifest_hash`. Passing describes the exit-code gate,
-not complete coverage: review errors, notes and truncation flags, since discarded
+or when its final value is `none`, and does not affect `manifest_hash`. Passing
+describes the exit-code gate, not complete coverage: review errors, notes and truncation flags, since discarded
 findings cannot contribute to the count.
 
 `summary.total_findings` counts emitted findings across all categories and
@@ -419,6 +449,15 @@ reported header line. This is a source-location count, not a count of distinct
 credentials; zero means no emitted secret findings, not complete coverage.
 Finding limits can omit locations. The count includes low-severity hints and is
 unchanged by `--triage`; it does not affect findings, gates or `manifest_hash`.
+
+`summary.findings_by_path_context` partitions retained findings across all
+categories into `scaffold` and `other` counts (both keys are present even at zero).
+It uses the existing case-insensitive path-segment heuristic used by
+`packages_by_path_context`, including test, fixture, example, documentation and
+`.github` directories. It counts findings, not distinct files; the two counts
+sum to `summary.total_findings`. Only findings retained after scan limits count.
+This path label does not establish whether a file is deployed or a finding is
+harmless, and it does not change raw severity, triage, or the severity gate.
 
 `summary.config_lines` counts distinct `(file, line)` locations in emitted
 configuration findings with a line number. Multiple rules on one line count once;
@@ -726,12 +765,24 @@ a credential is live. Test-path rule also widened in v0.4.1: `__fixtures__`, `__
 
 ### 3. `config`
 
+Dockerfile checks select files by a case-sensitive basename: exactly `Dockerfile`
+or a name beginning with `Dockerfile.`, at any included directory depth (for
+example, `services/api/Dockerfile.dev`). They do not select `Containerfile`,
+`dockerfile`, or `service.Dockerfile`. These other names can still receive
+independent secret-pattern scanning when otherwise eligible; absence of
+Dockerfile config findings does not establish that their contents were checked
+by the Dockerfile rules.
+
 * `.env` / `.env.*` with at least one assignment (`KEY=value`, optionally prefixed
   by `export`) — high. Filenames ending exactly in lowercase `.example`, `.sample`,
   `.template`, or `.dist` are exempt from this configuration check. This exemption
   does not suppress secret-pattern scanning: a credential-shaped value in an
   otherwise eligible template file can still produce a secret finding and trip
   `--fail-on`. Template filenames do not certify that their contents are safe.
+  This check reports one finding per file, at the first matching assignment;
+  empty values and public settings such as `PORT=8080` also count. It checks
+  assignment presence, not whether the value is a secret. Such a file can have
+  zero secret hits and still fail `--fail-on high`, including with `--triage`.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction —
   low, runtime user unverified (the base image may set `USER`; the scanner does not
   inspect images).
@@ -750,12 +801,20 @@ a credential is live. Test-path rule also widened in v0.4.1: `__fixtures__`, `__
 * Shell-form `Dockerfile` `RUN` with `curl` directly piped to `sh` or `bash` —
   medium. JSON exec-form instructions and indirect shell execution are not
   analyzed. This flags the command shape without fetching or running anything.
-* `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` containing a plain
+* `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` / `compose.yaml` containing a plain
   `privileged: true` declaration — medium. The key may be unquoted or enclosed in
   matching single or double quotes; the value must remain plain `true`.
   This line-based heuristic allows trailing
   comments, but ignores commented declarations, unrelated keys and longer scalar
   values such as `trueish`; it does not parse general YAML structure.
+  Filename matching is case-sensitive, but the key and plain value are matched
+  case-insensitively (for example, `"PRIVILEGED": TRUE`). Quoted values such as
+  `privileged: "true"` and inline mappings such as `{privileged: true}` are ignored.
+  Every matching line is reported, including in nested files, without checking
+  service ancestry: a matching line under an extension or unrelated mapping can
+  also be reported. A finding is a review prompt, not confirmation of effective
+  container privileges; absence of a finding does not establish that a Compose
+  file is unprivileged.
 * `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs
   that are not full 40-character hexadecimal commit SHAs — low. Includes
   `actions/*`; local `./` actions and `docker://` references are excluded.
@@ -780,6 +839,13 @@ a credential is live. Test-path rule also widened in v0.4.1: `__fixtures__`, `__
   still flagged; environment variables are never read or expanded.
   This configuration check skips full-line `#` and `;` comments (including
   indented comments). Secret-pattern scanning still checks commented text.
+  In each exact `.npmrc` or `.pypirc` file (including nested directories), this
+  check emits only the first qualifying config finding per file, at that line's
+  original line number, then stops checking that file. Skipped comments, empty
+  passwords and supported `.npmrc` environment references allow a later match.
+  This is not a count of credentials: later matching lines do not add config
+  findings, while the separate secret scan can emit additional findings in the
+  same file. Scan limits can also omit findings.
 
 All config checks listed above are implemented.
 

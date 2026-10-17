@@ -2,7 +2,7 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty]
+               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
                [--sort-keys | --no-sort-keys] [--unicode-json]
        scan.py --version
 
@@ -15,7 +15,9 @@ For local directories named -h, --help, or --version, use an explicit path:
   --json PATH     write JSON to PATH; use - for stdout (also the default).
                   Also accepts --json=PATH; PATH must be non-empty.
   --compact       write JSON on one line, to stdout or --json PATH.
-  --pretty        write indented JSON (the default); last formatting flag wins.
+  --pretty        write two-space indented JSON (default); last formatting flag wins.
+  --indent N      use N spaces per JSON level, one digit 0 through 8.
+                  Zero retains newlines without indentation; last formatting flag wins.
   --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-sort-keys  preserve default object-key order; last key-order flag wins.
   --unicode-json  retain non-ASCII characters in JSON (default: escape them).
@@ -25,6 +27,9 @@ For local directories named -h, --help, or --version, use an explicit path:
                   URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
                   Also accepts --fail-on=SEV.
+                  Values are case-insensitive; the last --fail-on value wins.
+                  Invalid earlier values still cause an argument error.
+                  A final none omits summary.gate.
                   Use none to disable the gate (the default); findings are still reported.
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
@@ -77,7 +82,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.20"
+VERSION = "0.4.21"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -1131,6 +1136,7 @@ def main(argv):
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
     compact = sort_keys = False
+    json_indent = 2
     unicode_json = False
     i = 1
     while i < len(args):
@@ -1165,7 +1171,15 @@ def main(argv):
             i += 1
         elif args[i] == "--pretty":
             compact = False
+            json_indent = 2
             i += 1
+        elif args[i] == "--indent":
+            if i + 1 >= len(args) or re.fullmatch(r"[0-8]", args[i + 1]) is None:
+                sys.stderr.write("--indent must be one digit from 0 to 8" + chr(10))
+                return 2
+            json_indent = int(args[i + 1])
+            compact = False
+            i += 2
         elif args[i] == "--sort-keys":
             sort_keys = True
             i += 1
@@ -1258,12 +1272,15 @@ def main(argv):
     files_by_sev = {severity: set() for severity in by_sev}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
+    findings_by_path_context = {"scaffold": 0, "other": 0}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
     dependency_findings_by_advisory = {}
     dependency_findings_by_ecosystem = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
+        context = "scaffold" if TEST_PATH_RE.search(f["file"]) else "other"
+        findings_by_path_context[context] += 1
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         files_by_sev.setdefault(f["severity"], set()).add(f["file"])
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
@@ -1330,6 +1347,7 @@ def main(argv):
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "total_findings": len(findings),
+            "findings_by_path_context": findings_by_path_context,
             "files_scanned": len(files),
             "files_with_findings": len({f["file"] for f in findings}),
             "findings_by_file": dict(sorted(findings_per_file.items())),
@@ -1415,7 +1433,7 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    options = {"separators": (",", ":")} if compact else {"indent": 2}
+    options = {"separators": (",", ":")} if compact else {"indent": json_indent}
     text = json.dumps(doc, sort_keys=sort_keys, ensure_ascii=not unicode_json, **options)
     if unicode_json:
         # Preserve JSON escapes for lone surrogates, including undecodable filenames.
