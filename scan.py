@@ -2,8 +2,9 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty]
+               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
                [--sort-keys | --no-sort-keys] [--unicode-json]
+               [--no-timestamp] [--no-commit] [--quiet] [--summary-only]
        scan.py --version
 
 For local directories named -h, --help, or --version, use an explicit path:
@@ -15,16 +16,27 @@ For local directories named -h, --help, or --version, use an explicit path:
   --json PATH     write JSON to PATH; use - for stdout (also the default).
                   Also accepts --json=PATH; PATH must be non-empty.
   --compact       write JSON on one line, to stdout or --json PATH.
-  --pretty        write indented JSON (the default); last formatting flag wins.
+  --pretty        write two-space indented JSON (default); last formatting flag wins.
+  --indent N      use N spaces per JSON level, one digit 0 through 8.
+                  Zero retains newlines without indentation; last formatting flag wins.
   --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-sort-keys  preserve default object-key order; last key-order flag wins.
   --unicode-json  retain non-ASCII characters in JSON (default: escape them).
                   Named files use UTF-8; stdout needs a Unicode-capable encoding.
+  --no-timestamp  omit scanned_at from JSON; other report fields are unchanged.
+  --no-commit     skip Git HEAD lookup; report commit as null (also used in manifest_hash).
+                  URL targets still clone; this does not disable network access.
+  --quiet         suppress the file-write confirmation; keep JSON, errors and gate diagnostics.
+  --summary-only omit findings and per-finding triage; keep summaries and errors.
+                  Scanning, manifest_hash and severity-gate exits are unchanged.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
   --fail-on SEV   exit 1 when any finding is at or above SEV (critical|high|medium|low).
                   Also accepts --fail-on=SEV.
+                  Values are case-insensitive; the last --fail-on value wins.
+                  Invalid earlier values still cause an argument error.
+                  A final none omits summary.gate.
                   Use none to disable the gate (the default); findings are still reported.
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
@@ -77,7 +89,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.20"
+VERSION = "0.4.22"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -1017,6 +1029,7 @@ def triage_findings(findings):
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     files_by_action = {action: set() for action in by_action}
     dep_upgrade = dep_monitor = dep_scaffold = 0
+    dep_upgrade_files = set()
     dependency_actions_by_severity = {
         action: dict.fromkeys((*SEV_ORDER, "unknown"), 0)
         for action in ("upgrade", "monitor")
@@ -1027,6 +1040,7 @@ def triage_findings(findings):
     secret_fp_reasons = {}
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
+    config_review_files = set()
     config_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     for f in findings:
         cat = f["category"]
@@ -1038,6 +1052,8 @@ def triage_findings(findings):
                      "note": "Patched release available: upgrade %s to %s."
                              % (f.get("package"), " / ".join(fixed))}
                 dep_upgrade += 1
+                if f.get("file"):
+                    dep_upgrade_files.add(f["file"])
             else:
                 t = {"action": "monitor",
                      "note": ("No patched release published for the advisory yet; pin the "
@@ -1082,6 +1098,8 @@ def triage_findings(findings):
             t = {"action": "review"}
             if cat == "config":
                 config_review += 1
+                if f.get("file"):
+                    config_review_files.add(f["file"])
                 severity = f.get("severity", "unknown")
                 config_review_by_severity[severity] = config_review_by_severity.get(severity, 0) + 1
         per_id[f["id"]] = t
@@ -1093,11 +1111,13 @@ def triage_findings(findings):
         "files_by_action": {action: len(paths) for action, paths in files_by_action.items()},
         "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
                        "in_scaffold_lockfiles": dep_scaffold},
+        "dependency_files_needing_upgrade": len(dep_upgrade_files),
         "dependency_outside_scaffold_lockfiles": outside_scaffold,
         "dependency_actions_by_severity": dependency_actions_by_severity,
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
+        "config_files_needing_review": len(config_review_files),
         "config_review_by_severity": config_review_by_severity,
         "secret_review_by_severity": sec_review_by_severity,
         "secret_files_needing_review": len(sec_review_files),
@@ -1130,7 +1150,9 @@ def main(argv):
         return 0
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
-    compact = sort_keys = False
+    compact = sort_keys = no_timestamp = quiet = summary_only = False
+    include_commit = True
+    json_indent = 2
     unicode_json = False
     i = 1
     while i < len(args):
@@ -1165,12 +1187,32 @@ def main(argv):
             i += 1
         elif args[i] == "--pretty":
             compact = False
+            json_indent = 2
+            i += 1
+        elif args[i] == "--indent":
+            if i + 1 >= len(args) or re.fullmatch(r"[0-8]", args[i + 1]) is None:
+                sys.stderr.write("--indent must be one digit from 0 to 8" + chr(10))
+                return 2
+            json_indent = int(args[i + 1])
+            compact = False
+            i += 2
+        elif args[i] == "--no-timestamp":
+            no_timestamp = True
             i += 1
         elif args[i] == "--sort-keys":
             sort_keys = True
             i += 1
         elif args[i] == "--no-sort-keys":
             sort_keys = False
+            i += 1
+        elif args[i] == "--no-commit":
+            include_commit = False
+            i += 1
+        elif args[i] == "--quiet":
+            quiet = True
+            i += 1
+        elif args[i] == "--summary-only":
+            summary_only = True
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
@@ -1258,12 +1300,15 @@ def main(argv):
     files_by_sev = {severity: set() for severity in by_sev}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
+    findings_by_path_context = {"scaffold": 0, "other": 0}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
     dependency_findings_by_advisory = {}
     dependency_findings_by_ecosystem = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
+        context = "scaffold" if TEST_PATH_RE.search(f["file"]) else "other"
+        findings_by_path_context[context] += 1
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         files_by_sev.setdefault(f["severity"], set()).add(f["file"])
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
@@ -1309,28 +1354,40 @@ def main(argv):
             label = f["summary"]
             config_issues_by_rule[label] = config_issues_by_rule.get(label, 0) + 1
 
+    config_lines_by_rule = {}
+    for f in findings:
+        if f["category"] == "config" and f["line"] is not None:
+            config_lines_by_rule.setdefault(f["summary"], set()).add((f["file"], f["line"]))
+
     config_files_by_rule = {}
     for f in findings:
         if f["category"] == "config":
             config_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
 
     secret_files_by_rule = {}
+    secret_lines_by_rule = {}
     for f in findings:
         if f["category"] == "secret":
             secret_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
+            secret_lines_by_rule.setdefault(f["summary"], set()).add((f["file"], f["line"]))
 
     dependency_files_by_ecosystem = {}
     for f in findings:
         if f["category"] == "dependency-vuln":
             dependency_files_by_ecosystem.setdefault(f["ecosystem"], set()).add(f["file"])
 
-    commit = git_head(root)
+    commit = git_head(root) if include_commit else None
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "total_findings": len(findings),
+            "finding_lines": len({(f["file"], f["line"]) for f in findings
+                                  if f["line"] is not None}),
+            "findings_by_path_context": findings_by_path_context,
             "files_scanned": len(files),
+            "files_without_findings": sum(
+                1 for path in files if os.path.relpath(path, root) not in findings_per_file),
             "files_with_findings": len({f["file"] for f in findings}),
             "findings_by_file": dict(sorted(findings_per_file.items())),
             "files_with_findings_by_category": {
@@ -1366,9 +1423,15 @@ def main(argv):
             "secret_files_by_rule": {
                 rule: len(paths) for rule, paths in sorted(secret_files_by_rule.items())
             },
+            "secret_lines_by_rule": {
+                rule: len(locations) for rule, locations in sorted(secret_lines_by_rule.items())
+            },
             "config_issues": sum(1 for f in findings if f["category"] == "config"),
             "config_lines": len({(f["file"], f["line"]) for f in findings
                                  if f["category"] == "config" and f["line"] is not None}),
+            "config_lines_by_rule": {
+                rule: len(locations) for rule, locations in sorted(config_lines_by_rule.items())
+            },
             "config_files_by_rule": {
                 rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
             },
@@ -1415,7 +1478,12 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    options = {"separators": (",", ":")} if compact else {"indent": 2}
+    if no_timestamp:
+        del doc["scanned_at"]
+    if summary_only:
+        del doc["findings"]
+        doc.pop("triage", None)
+    options = {"separators": (",", ":")} if compact else {"indent": json_indent}
     text = json.dumps(doc, sort_keys=sort_keys, ensure_ascii=not unicode_json, **options)
     if unicode_json:
         # Preserve JSON escapes for lone surrogates, including undecodable filenames.
@@ -1423,7 +1491,8 @@ def main(argv):
     if out_path and out_path != "-":
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(text + "\n")
-        sys.stderr.write("wrote %s (%d findings)\n" % (out_path, len(findings)))
+        if not quiet:
+            sys.stderr.write("wrote %s (%d findings)\n" % (out_path, len(findings)))
     else:
         print(text)
     if fail_on is not None and any(
