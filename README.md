@@ -51,7 +51,17 @@ objects, for easier report comparisons. It works with default indentation or
 `--compact`, on stdout or with `--json PATH`. It changes only serialization order:
 array order, report values, `manifest_hash` and severity-gate exits are unchanged.
 Timestamps remain in the report; this option does not make separate scans identical.
-Without this flag, the existing object-key order is preserved.
+Without this flag, the existing object-key order is preserved. Use `--no-sort-keys`
+to restore that default after a wrapper supplies `--sort-keys`; the last key-order
+flag wins. This also restores the default order in nested objects.
+
+Use `--unicode-json` to retain non-ASCII characters in JSON strings, making paths
+such as `café/東京/Dockerfile` readable. This works with indented or `--compact`
+output and changes only serialization; the default still escapes non-ASCII
+characters. Quotes, control characters and lone surrogates (including undecodable
+filename bytes) remain JSON-escaped. Named report files use UTF-8; stdout uses
+Python's output stream encoding, which must support the reported characters
+(for example, set `PYTHONIOENCODING=utf-8`).
 
 Run `python3 scan.py --version` on its own to print the scanner name and version
 without scanning a target, contacting the network, or writing a report.
@@ -66,7 +76,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.19
+- uses: project-feldspar-resources/feldspar-scan@v0.4.20
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -84,7 +94,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.19`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.20`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -199,6 +209,15 @@ order. Only affected ecosystems appear, and the counts sum to
 Multiple advisories for one package version count once; distinct versions count
 separately. No returned vulnerabilities or `--no-osv` produces `{}`. These counts
 do not establish lookup completeness or change findings, gates, or `manifest_hash`.
+
+`summary.dependency_files_by_ecosystem` counts distinct representative manifest
+paths in emitted dependency findings, grouped in sorted ecosystem order. Several
+vulnerable packages in one file count once within that ecosystem. Only ecosystems
+with retained findings appear; no dependency findings (including `--no-osv`)
+produces `{}`. Global and per-file finding caps can reduce these counts. The
+scanner attributes each package version to one representative manifest, so this
+is not an inventory of every affected manifest or proof of advisory coverage.
+This summary does not change findings, gates, triage, or `manifest_hash`.
 
 `summary.packages_by_manifest` counts deduplicated inventory entries attributed to
 each parsed manifest, in sorted path order, including zero counts. Each unique
@@ -337,6 +356,18 @@ Zero means no advisory IDs were emitted, including with `--no-osv`; it does not
 certify coverage or successful lookups. Check errors, notes and truncation flags.
 This summary field does not affect `manifest_hash`.
 
+`summary.dependency_findings_by_advisory` maps each advisory ID to the number of
+emitted dependency findings referencing it, with keys sorted alphabetically.
+Repeated IDs within one finding count once; distinct package versions and
+ecosystems count separately. Duplicate manifests for the same ecosystem, package
+and version do not add findings. Different advisory IDs remain separate even
+when they are aliases. The number of keys equals `summary.unique_advisories`;
+the values can sum to more than the dependency finding count because a finding
+may reference several advisories. Counts include only findings retained after
+limits, and no emitted dependency findings produces `{}`, including with
+`--no-osv`. This is not a coverage guarantee. Findings, gates, triage and
+`manifest_hash` are unchanged by this summary.
+
 When `--fail-on` is supplied, `summary.gate` records the normalized `threshold`,
 the number of emitted raw findings at or above it (`matching_findings`), and
 `passed` (true when that count is zero). `unknown` never matches a threshold;
@@ -365,6 +396,14 @@ below `low`; files without findings are omitted, and an empty scan returns `{}`.
 This summarizes emitted findings only, so finding caps can hide higher-severity
 results. Check `summary.truncated` for incomplete results. Like the overall
 highest severity, this field does not affect `manifest_hash`.
+
+`summary.files_by_highest_severity` counts each affected relative file path once,
+at its highest emitted raw severity across all categories. It includes zero counts
+for `critical`, `high`, `medium`, `low`, and `unknown` (`unknown` ranks below `low`).
+The counts sum to `summary.files_with_findings`; files without findings do not count.
+Only findings retained after limits contribute, so check `summary.truncated` for
+incomplete results. Triage does not change these counts, and they do not affect
+`manifest_hash` or the severity gate.
 
 `summary.files_by_severity` counts distinct relative file paths at each raw severity
 (`critical`, `high`, `medium`, `low`, `unknown`), including zero counts. Repeated
@@ -397,11 +436,21 @@ severities, are unchanged by `--triage`, and do not affect `manifest_hash` or ga
 
 ### Triage (`--triage`)
 
+`triage_summary.dependency_actions_by_severity` groups emitted dependency findings
+into `upgrade` and `monitor` rows, each with raw-severity counts (`critical`,
+`high`, `medium`, `low`, `unknown`, including zeros). A finding counts once,
+regardless of its advisory IDs or fixed versions; a non-empty `fixed_in` selects
+`upgrade`, otherwise `monitor`, following the existing triage actions. Scaffold
+lockfiles are included at their raw severity even when triage marks their priority
+low. These opt-in counts cover only retained findings after scan limits and do
+not prove advisory coverage or that every advisory has a fix. They do not change
+findings, the headline, severity gates, or `manifest_hash`.
+
 With `--triage` the output gains two additive top-level keys and the raw findings
 and `manifest_hash` stay untouched:
 
 - `triage_summary` — counts and a one-line `headline`: dependency findings split
-  into `upgradeable` (a patched release exists) vs `monitor_only` (no patch yet),
+  into `upgradeable` (nonempty `fixed_in`) vs `monitor_only` (empty `fixed_in`),
   and secret hits split into `needs_review` vs `likely_false_positive`.
   The headline is a human-readable summary whose wording may change between
   releases; consumers read counts from the structured fields (`triage_summary`,
@@ -413,6 +462,10 @@ and `manifest_hash` stay untouched:
   `config.needs_review` counts configuration findings and includes them in the
   headline, including when no secrets or dependency findings exist. Like other
   triage counts, it covers only emitted findings when scan limits truncate results.
+  `config_review_by_severity` breaks down those configuration findings by raw
+  severity (`critical`, `high`, `medium`, `low`, `unknown`, including zeros).
+  Configuration findings under test/fixture paths still count as needing review;
+  these counts do not alter findings, triage actions, or the raw severity gate.
 - `triage` — a map from finding `id` to an interpretation: for a `dependency-vuln`,
   `action` is `upgrade` (with `upgrade_to`) or `monitor`; for a `secret`,
   `likely_false_positive` is set true when the hit sits in a test/fixture/example/CI
@@ -421,7 +474,18 @@ and `manifest_hash` stay untouched:
   example key — see the secret section), routing everything else to `review`;
   `config` findings are `review`.
 
-This is purely deterministic prioritisation (fix-status + path-based false-positive
+Dependency actions use reported fix metadata, not an independent check of release
+availability. `monitor` means the finding has no reported fixed version: this can
+also happen when advisory details omit fix metadata or fail to load. It
+does not prove that no patched release exists; review `errors` and the advisories.
+`upgrade` means at least one advisory contributed a fixed version. A finding can
+combine multiple advisories, so a nonempty `upgrade_to` list
+does not prove that every advisory is resolved by a listed version. Confirm the
+applicable release against each advisory before choosing an upgrade. Existing
+headline and note phrases such as "no patched release" are metadata-based labels,
+not guarantees about available releases.
+
+This is purely deterministic prioritisation (fix metadata + path-based false-positive
 classification). It never clears a secret found in real source — it flags it for a
 human. It exists so a reader does not have to hand-triage a long raw list.
 
@@ -431,6 +495,15 @@ number of emitted findings, not files or advisory IDs. `review` includes config
 findings; scaffold dependency findings retain their upgrade/monitor action.
 When scan limits truncate the report, these counts cover only emitted findings.
 This field is present only with `--triage` and does not change the severity gate.
+
+`triage_summary.files_by_action` counts distinct relative file paths for each of
+the same four actions, including zero-valued buckets. Repeated findings assigned
+to one action in a file count once; a file with different actions counts in each
+applicable bucket, so these counts need not sum to the total number of files.
+Findings without a non-empty file path do not add to these file counts.
+Scaffold dependencies retain their upgrade/monitor action. Counts cover only
+emitted findings when limits truncate the report. This field is present only
+with `--triage` and does not change findings, the hash, or the severity gate.
 
 `triage_summary.secret_files_needing_review` counts distinct relative file paths
 with emitted secret findings classified as `review`. Repeated hits in one file
