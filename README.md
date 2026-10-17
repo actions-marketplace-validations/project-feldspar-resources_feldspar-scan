@@ -74,6 +74,18 @@ filename bytes) remain JSON-escaped. Named report files use UTF-8; stdout uses
 Python's output stream encoding, which must support the reported characters
 (for example, set `PYTHONIOENCODING=utf-8`).
 
+Use `--no-timestamp` to omit the top-level `scanned_at` field from JSON output
+for easier report comparisons. The timestamp remains present by default. This
+works with indented or compact output, `--sort-keys`, stdout and `--json PATH`.
+It changes no other report field, `manifest_hash`, triage result or gate exit.
+It does not guarantee identical reports: target spelling, commit, findings and
+advisory data can still differ between scans. Repeating the flag is harmless.
+
+Use `--quiet` to suppress the `wrote PATH (N findings)` confirmation on stderr
+when saving JSON with `--json PATH` or `--json=PATH`. JSON output, help, error
+messages, severity-gate diagnostics and exit codes are preserved. With stdout
+output (including `--json -`), this flag has no effect on the report.
+
 Run `python3 scan.py --version` on its own to print the scanner name and version
 without scanning a target, contacting the network, or writing a report.
 
@@ -87,7 +99,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.21
+- uses: project-feldspar-resources/feldspar-scan@v0.4.22
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -105,7 +117,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.21`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.22`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -172,8 +184,24 @@ committed `.env`. All three detectors should fire.
 
 ## Output shape
 
-Top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
+Use `--no-commit` to skip Git HEAD lookup and report `commit` as JSON `null`.
+By default the scanner still attempts the lookup. The flag does not change
+findings, triage or severity-gate exits. `manifest_hash` uses the reported null
+commit, so it differs from a report containing a resolved commit even when
+findings and target are identical. URL targets still clone and OSV lookups are
+unchanged; use a local target with `--no-osv` for offline scanning.
+
+Default top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
+
+Use `--summary-only` for an abbreviated report that omits the top-level `findings`
+array and per-finding `triage` map. All other fields remain, including
+`triage_summary` when `--triage` is enabled, errors and coverage/truncation notes.
+This works with stdout or `--json PATH` and the JSON formatting flags. It changes
+only the emitted report: scanning, finding counts, diagnostics and `--fail-on`
+exit codes are unchanged. `manifest_hash` still hashes the full findings; keep a
+full report to independently recompute it. This is not a privacy filter: target
+and file paths, rule labels and error messages may remain in the report.
 
 `commit` is a best-effort lookup of Git `HEAD` at the scan root. Scanning a
 subdirectory of a repository can report that enclosing repository's HEAD while
@@ -196,6 +224,15 @@ oversized files still count, and secret scanning skips lockfiles and common
 binary/image extensions. Excluded directories and symlinks do not count. When
 `summary.truncated.files` is true, additional candidate files were omitted.
 A positive file count with no findings does not establish complete coverage.
+
+`summary.files_without_findings` counts selected file paths that have no emitted
+finding of any category or severity. Empty scans report zero. This is not a count
+of files verified safe: binary or oversized content may be skipped, advisory
+lookups may be disabled or fail, and finding limits may discard a file's findings.
+File limits exclude unselected paths from this count. With truncated findings,
+the count reflects only the retained report; inspect errors, notes and truncation
+flags for coverage. Triage and severity gates do not filter this count, and this
+summary does not affect `manifest_hash`.
 
 `summary.skipped_non_regular` counts entries rejected during the filesystem walk
 because they are not regular files or real directories, or because their metadata
@@ -296,6 +333,15 @@ files with no findings, and is `{}` for an empty report. Counts sum to the lengt
 of `findings`; a dependency finding with multiple advisories counts once. Scan
 limits restrict these counts to retained findings, and the mapping does not
 change with `--triage` or affect `manifest_hash`.
+
+`summary.finding_lines` counts distinct `(file, line)` locations across all
+emitted findings with a non-null line number. Multiple rules or categories on
+one line count once; equal line numbers in different files count separately.
+Findings without a line number, including dependency findings and the missing
+Dockerfile USER check, are excluded. Empty or entirely unlocated reports yield
+zero. This counts retained finding locations after limits, not lines scanned,
+all affected files, or source coverage. Triage does not filter the count;
+findings, severity gates and `manifest_hash` are unchanged.
 
 `summary.files_with_findings_by_category` counts distinct relative file paths for
 each of `dependency-vuln`, `secret`, and `config`, including zero counts. Repeated
@@ -465,6 +511,15 @@ the same line number in different files counts separately. File-wide findings
 with a null line (such as a missing Dockerfile USER) are excluded. This counts
 only retained findings after scan limits, not every configuration line scanned.
 
+`summary.config_lines_by_rule` maps configuration finding summary labels to
+counts of distinct `(file, line)` locations, sorted alphabetically by label.
+Repeated hits for the same rule on one line count once; the same line number in
+different files counts separately. Findings with `line: null` are excluded, and
+rules with no line-addressable findings are omitted (an empty report uses `{}`).
+Different rules can share a location, so adding these counts need not equal
+`summary.config_lines`. Counts describe only emitted findings after finding caps;
+they do not measure unchecked locations or change findings, triage, gates or hashes.
+
 `summary.config_files_by_rule` maps configuration finding summary labels to
 distinct affected-file counts, in alphabetical label order. Repeated warnings
 for one rule in one file count once; the same file can count under several rules.
@@ -544,6 +599,25 @@ Scaffold dependencies retain their upgrade/monitor action. Counts cover only
 emitted findings when limits truncate the report. This field is present only
 with `--triage` and does not change findings, the hash, or the severity gate.
 
+With `--triage`, `triage_summary.config_files_needing_review` counts distinct
+relative file paths with emitted configuration findings. Multiple findings in
+one file count once; files in test/example/fixture paths still count because
+configuration findings retain their `review` action. Secret and dependency
+findings do not contribute. The count is zero when no configuration files need
+review, and covers only retained findings when scan limits truncate results.
+The existing `triage_summary.config.needs_review` remains a finding count.
+This additional count does not change findings, triage actions, the hash or gate.
+
+With `--triage`, `triage_summary.dependency_files_needing_upgrade` counts distinct
+representative manifest paths in emitted dependency findings with an `upgrade`
+action. Multiple packages or advisories in one file count once; scaffold paths
+still count. Monitor-only dependencies and non-dependency findings do not count.
+The count is zero when no emitted dependency finding has fix metadata. It uses
+the existing representative-manifest attribution after package deduplication,
+so it is not a count of every affected manifest. Finding limits can reduce it;
+this count does not establish complete advisory coverage or that an upgrade
+resolves every advisory. Findings, triage actions, the hash and gate are unchanged.
+
 `triage_summary.secret_files_needing_review` counts distinct relative file paths
 with emitted secret findings classified as `review`. Repeated hits in one file
 count once; likely-false-positive secrets and non-secret findings do not count.
@@ -577,6 +651,15 @@ secret findings, including low-severity and likely-false-positive hits, and are
 unchanged by `--triage`. Scan limits may omit affected files. No secret findings
 yields `{}`; this does not certify complete coverage. This summary does not change
 findings, redaction, `manifest_hash`, or severity gates.
+
+`summary.secret_lines_by_rule` maps the same human-readable secret labels to
+counts of distinct `(file, line)` locations, in alphabetical label order.
+Repeated hits for one label on one line count once; the same line may count
+under several labels, and the same line number in separate files counts separately.
+All emitted secret findings count, including low-severity and likely-false-positive
+hits. Only retained findings count when scan limits truncate results. No secret
+findings yields `{}`; this does not certify complete coverage. This summary adds
+no matched values and does not change findings, `manifest_hash`, triage, or gates.
 
 ## What it checks
 
