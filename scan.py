@@ -2,7 +2,8 @@
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
-               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty] [--sort-keys]
+               [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty]
+               [--sort-keys | --no-sort-keys] [--unicode-json]
        scan.py --version
 
 For local directories named -h, --help, or --version, use an explicit path:
@@ -16,6 +17,9 @@ For local directories named -h, --help, or --version, use an explicit path:
   --compact       write JSON on one line, to stdout or --json PATH.
   --pretty        write indented JSON (the default); last formatting flag wins.
   --sort-keys     alphabetically sort JSON object keys, including nested objects.
+  --no-sort-keys  preserve default object-key order; last key-order flag wins.
+  --unicode-json  retain non-ASCII characters in JSON (default: escape them).
+                  Named files use UTF-8; stdout needs a Unicode-capable encoding.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
@@ -25,8 +29,9 @@ For local directories named -h, --help, or --version, use an explicit path:
                   "unknown"-severity findings never trigger the gate.
   --triage        add a deterministic interpretation layer (top-level "triage" +
                   "triage_summary"): classifies secret hits in test/fixture/example
-                  paths as likely false positives, and marks each dependency advisory
-                  as upgrade (patch available) or monitor (no patched release yet).
+                  paths as likely false positives, and marks each dependency finding
+                  as upgrade (reported fix metadata) or monitor (no reported fix metadata).
+                  Missing metadata can reflect failed lookups; review errors and advisories.
                   Discovers nothing and adds no findings, so the raw findings set and
                   manifest_hash are unchanged; triage is a separate, additive section.
                   v0.4: dependency hits from lockfiles under test/fixture/example/benchmark
@@ -72,7 +77,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.19"
+VERSION = "0.4.20"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -1010,13 +1015,19 @@ def triage_findings(findings):
     """Deterministic interpretation of the raw findings. Returns (per_id, summary)."""
     per_id = {}
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
+    files_by_action = {action: set() for action in by_action}
     dep_upgrade = dep_monitor = dep_scaffold = 0
+    dependency_actions_by_severity = {
+        action: dict.fromkeys((*SEV_ORDER, "unknown"), 0)
+        for action in ("upgrade", "monitor")
+    }
     outside_scaffold = {"upgradeable": 0, "monitor_only": 0}
     sec_total = sec_fp = 0
     sec_review_files = set()
     secret_fp_reasons = {}
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
+    config_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     for f in findings:
         cat = f["category"]
         t = {}
@@ -1033,6 +1044,9 @@ def triage_findings(findings):
                               "version, monitor the advisory, and apply any documented "
                               "mitigation. Not fixable by upgrade today.")}
                 dep_monitor += 1
+            counts = dependency_actions_by_severity[t["action"]]
+            severity = f.get("severity", "unknown")
+            counts[severity] = counts.get(severity, 0) + 1
             lock = f.get("file") or ""
             m = TEST_PATH_RE.search(lock)
             if m:
@@ -1068,16 +1082,23 @@ def triage_findings(findings):
             t = {"action": "review"}
             if cat == "config":
                 config_review += 1
+                severity = f.get("severity", "unknown")
+                config_review_by_severity[severity] = config_review_by_severity.get(severity, 0) + 1
         per_id[f["id"]] = t
         by_action[t["action"]] += 1
+        if f.get("file"):
+            files_by_action[t["action"]].add(f["file"])
     summary = {
         "by_action": by_action,
+        "files_by_action": {action: len(paths) for action, paths in files_by_action.items()},
         "dependency": {"upgradeable": dep_upgrade, "monitor_only": dep_monitor,
                        "in_scaffold_lockfiles": dep_scaffold},
         "dependency_outside_scaffold_lockfiles": outside_scaffold,
+        "dependency_actions_by_severity": dependency_actions_by_severity,
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
+        "config_review_by_severity": config_review_by_severity,
         "secret_review_by_severity": sec_review_by_severity,
         "secret_files_needing_review": len(sec_review_files),
         "secret_false_positive_reasons": dict(sorted(secret_fp_reasons.items())),
@@ -1110,6 +1131,7 @@ def main(argv):
     target = args[0]
     out_path, use_osv, fail_on, triage = None, True, None, False
     compact = sort_keys = False
+    unicode_json = False
     i = 1
     while i < len(args):
         if args[i].startswith("--fail-on="):
@@ -1138,11 +1160,17 @@ def main(argv):
         elif args[i] == "--compact":
             compact = True
             i += 1
+        elif args[i] == "--unicode-json":
+            unicode_json = True
+            i += 1
         elif args[i] == "--pretty":
             compact = False
             i += 1
         elif args[i] == "--sort-keys":
             sort_keys = True
+            i += 1
+        elif args[i] == "--no-sort-keys":
+            sort_keys = False
             i += 1
         elif args[i] == "--fail-on" and i + 1 < len(args):
             fail_on = args[i + 1].lower()
@@ -1232,6 +1260,7 @@ def main(argv):
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
+    dependency_findings_by_advisory = {}
     dependency_findings_by_ecosystem = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
@@ -1244,10 +1273,18 @@ def main(argv):
         if f["category"] == "secret":
             label = f["summary"]
             secret_hits_by_rule[label] = secret_hits_by_rule.get(label, 0) + 1
+        if f["category"] == "dependency-vuln":
+            for advisory in set(f["vuln_ids"]):
+                dependency_findings_by_advisory[advisory] = (
+                    dependency_findings_by_advisory.get(advisory, 0) + 1)
         # Findings are already sorted from highest to lowest severity.
         highest_severity_by_file.setdefault(f["file"], f["severity"])
         counts = by_category_severity.setdefault(f["category"], dict.fromkeys(by_sev, 0))
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
+
+    files_by_highest_severity = dict.fromkeys(by_sev, 0)
+    for severity in highest_severity_by_file.values():
+        files_by_highest_severity[severity] += 1
 
     packages_by_ecosystem = {}
     for ecosystem, _, _ in sorted(pkgs):
@@ -1282,6 +1319,11 @@ def main(argv):
         if f["category"] == "secret":
             secret_files_by_rule.setdefault(f["summary"], set()).add(f["file"])
 
+    dependency_files_by_ecosystem = {}
+    for f in findings:
+        if f["category"] == "dependency-vuln":
+            dependency_files_by_ecosystem.setdefault(f["ecosystem"], set()).add(f["file"])
+
     commit = git_head(root)
     doc = {
         "scanner": SCANNER, "version": VERSION, "target": target, "commit": commit,
@@ -1306,10 +1348,15 @@ def main(argv):
             "dependency_findings_without_fixes": sum(
                 1 for f in findings if f["category"] == "dependency-vuln" and not f["fixed_in"]),
             "vulnerable_packages_by_ecosystem": vulnerable_packages_by_ecosystem,
+            "dependency_files_by_ecosystem": {
+                ecosystem: len(paths)
+                for ecosystem, paths in sorted(dependency_files_by_ecosystem.items())
+            },
             "dependency_findings_by_ecosystem": dict(sorted(dependency_findings_by_ecosystem.items())),
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"
                                       for vid in f["vuln_ids"]}),
+            "dependency_findings_by_advisory": dict(sorted(dependency_findings_by_advisory.items())),
             "osv_enabled": use_osv,
             "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
@@ -1330,6 +1377,7 @@ def main(argv):
             "files_by_severity": {severity: len(paths) for severity, paths in files_by_sev.items()},
             "highest_severity": findings[0]["severity"] if findings else None,
             "highest_severity_by_file": dict(sorted(highest_severity_by_file.items())),
+            "files_by_highest_severity": files_by_highest_severity,
             "by_category": by_category,
             "by_category_severity": by_category_severity,
             "lockfiles_parsed": sorted(PARSED_LOCKFILES),
@@ -1367,10 +1415,13 @@ def main(argv):
         doc["triage"] = per_id
     if ERRORS:
         doc["errors"] = ERRORS
-    text = (json.dumps(doc, separators=(",", ":"), sort_keys=sort_keys) if compact
-            else json.dumps(doc, indent=2, sort_keys=sort_keys))
+    options = {"separators": (",", ":")} if compact else {"indent": 2}
+    text = json.dumps(doc, sort_keys=sort_keys, ensure_ascii=not unicode_json, **options)
+    if unicode_json:
+        # Preserve JSON escapes for lone surrogates, including undecodable filenames.
+        text = text.encode("utf-8", errors="backslashreplace").decode("utf-8")
     if out_path and out_path != "-":
-        with open(out_path, "w") as fh:
+        with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(text + "\n")
         sys.stderr.write("wrote %s (%d findings)\n" % (out_path, len(findings)))
     else:
