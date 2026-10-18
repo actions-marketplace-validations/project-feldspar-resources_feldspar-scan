@@ -5,6 +5,7 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
                [--sort-keys | --no-sort-keys] [--unicode-json | --ascii-json]
                [--no-timestamp] [--no-commit] [--quiet] [--summary-only | --full-report]
+               [--timestamp] [--commit] [--no-quiet]
        scan.py --version
 
 For local directories named -h, --help, or --version, use an explicit path:
@@ -25,10 +26,13 @@ For local directories named -h, --help, or --version, use an explicit path:
   --unicode-json  retain non-ASCII characters in JSON (default: escape them).
                   Named files use UTF-8; stdout needs a Unicode-capable encoding.
   --ascii-json    escape non-ASCII characters (default); last encoding flag wins.
+  --timestamp     include scanned_at (default); last timestamp flag wins.
   --no-timestamp  omit scanned_at from JSON; other report fields are unchanged.
   --no-commit     skip Git HEAD lookup; report commit as null (also used in manifest_hash).
                   URL targets still clone; this does not disable network access.
+  --commit        restore Git HEAD lookup (default); last commit flag wins.
   --quiet         suppress the file-write confirmation; keep JSON, errors and gate diagnostics.
+  --no-quiet      restore file-write confirmation (default); last confirmation flag wins.
   --summary-only omit findings and per-finding triage; keep summaries and errors.
                   Scanning, manifest_hash and severity-gate exits are unchanged.
   --full-report  include findings and optional triage (default); last report-detail flag wins.
@@ -92,7 +96,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.25"
+VERSION = "0.4.26"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -254,7 +258,7 @@ def parse_package_lock(text):
                 name = key.rsplit("node_modules/", 1)[1]
             else:
                 continue
-            if name and isinstance(ver, str) and ver:
+            if name and isinstance(ver, str) and ver.strip():
                 out.append(("npm", name, ver))
     deps = data.get("dependencies")
     if isinstance(deps, dict) and not out:
@@ -268,7 +272,7 @@ def parse_package_lock(text):
             name, meta = item
             if isinstance(meta, dict):
                 ver = meta.get("version")
-                if name and isinstance(ver, str) and ver:
+                if name and isinstance(ver, str) and ver.strip():
                     out.append(("npm", name, ver))
                 if isinstance(meta.get("dependencies"), dict):
                     stack.append(iter(meta["dependencies"].items()))
@@ -1227,6 +1231,9 @@ def main(argv):
             json_indent = int(args[i + 1])
             compact = False
             i += 2
+        elif args[i] == "--timestamp":
+            no_timestamp = False
+            i += 1
         elif args[i] == "--no-timestamp":
             no_timestamp = True
             i += 1
@@ -1239,11 +1246,17 @@ def main(argv):
         elif args[i] == "--no-commit":
             include_commit = False
             i += 1
+        elif args[i] == "--commit":
+            include_commit = True
+            i += 1
         elif args[i] == "--quiet":
             quiet = True
             i += 1
         elif args[i] == "--full-report":
             summary_only = False
+            i += 1
+        elif args[i] == "--no-quiet":
+            quiet = False
             i += 1
         elif args[i] == "--summary-only":
             summary_only = True

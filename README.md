@@ -77,8 +77,10 @@ escaping after a wrapper supplies `--unicode-json`; the last encoding flag wins.
 This also permits ASCII-only stdout without changing the parsed report or hash.
 
 Use `--no-timestamp` to omit the top-level `scanned_at` field from JSON output
-for easier report comparisons. The timestamp remains present by default. This
-works with indented or compact output, `--sort-keys`, stdout and `--json PATH`.
+for easier report comparisons. Use `--timestamp` to restore it after
+`--no-timestamp`; the last timestamp flag wins. The timestamp remains present
+by default. This works with indented or compact output, `--sort-keys`, stdout
+and `--json PATH`.
 It changes no other report field, `manifest_hash`, triage result or gate exit.
 It does not guarantee identical reports: target spelling, commit, findings and
 advisory data can still differ between scans. Repeating the flag is harmless.
@@ -87,6 +89,8 @@ Use `--quiet` to suppress the `wrote PATH (N findings)` confirmation on stderr
 when saving JSON with `--json PATH` or `--json=PATH`. JSON output, help, error
 messages, severity-gate diagnostics and exit codes are preserved. With stdout
 output (including `--json -`), this flag has no effect on the report.
+Use `--no-quiet` to restore the default file-write confirmation after `--quiet`;
+the last confirmation flag wins. Neither flag changes JSON output or diagnostics.
 
 Run `python3 scan.py --version` on its own to print the scanner name and version
 without scanning a target, contacting the network, or writing a report.
@@ -101,7 +105,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.25
+- uses: project-feldspar-resources/feldspar-scan@v0.4.26
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -119,7 +123,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.25`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.26`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -192,6 +196,11 @@ findings, triage or severity-gate exits. `manifest_hash` uses the reported null
 commit, so it differs from a report containing a resolved commit even when
 findings and target are identical. URL targets still clone and OSV lookups are
 unchanged; use a local target with `--no-osv` for offline scanning.
+
+Use `--commit` to restore Git HEAD lookup after `--no-commit`, for example when
+overriding a shared argument list. The last commit flag wins. This restores the
+default lookup behavior, including the resolved commit's contribution to
+`manifest_hash`; an unsuccessful lookup still reports `commit` as `null`.
 
 Default top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
@@ -340,6 +349,27 @@ reflect the current working tree, so uncommitted edits can change the hash even
 with the same commit and OSV data. Edits that leave findings unchanged do not
 change it when target and commit are unchanged. `target` preserves the literal
 CLI argument: different spellings of the same path can produce different hashes.
+
+To recompute it from a full JSON report, use Python's ASCII-escaped JSON strings
+(`ensure_ascii=True`), sorted object keys, and compact separators, then hash the
+UTF-8 bytes without a trailing newline. Array order is preserved. Non-ASCII
+characters stay escaped in this hash input even with `--unicode-json`; report
+indentation and key-order flags do not change it. For example, with a full report
+saved as `report.json`:
+
+```python
+import hashlib
+import json
+
+with open("report.json", encoding="utf-8") as report_file:
+    report = json.load(report_file)
+payload = {key: report[key] for key in ("findings", "target", "commit")}
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True)
+assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == report["manifest_hash"]
+```
+
+This recipe requires the full `findings` array; `--summary-only` output omits it.
 
 Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
@@ -874,6 +904,14 @@ suppress `go.sum` merely because it exists on disk. Review
 `summary.lockfiles_parsed` and `summary.packages_found`: zero packages in these
 cases does not mean the checksum-listed dependencies were assessed.
 
+For `package-lock.json`, inventory is not filtered to production dependencies or
+to packages installed on the current machine. Both the v2/v3 `packages` map and
+the v1 `dependencies` tree include recognized name/version entries regardless of
+`dev`, `optional`, `devOptional`, `os`, or `cpu` metadata, including nested entries.
+These entries count in package summaries and are eligible for advisory lookup;
+`--no-osv` keeps the inventory but skips that lookup. A reported package therefore
+does not establish that it is installed or used in the deployed application.
+
 For `Gemfile.lock`, only gems listed in `GEM` sections enter the package inventory
 and RubyGems advisory lookup. Gems listed under `GIT` or `PATH` are excluded,
 even if their names and versions resemble registry gems. A lockfile containing
@@ -900,15 +938,43 @@ and `BUNDLED WITH` metadata alone supply no package versions. This is lockfile
 inventory, not resolution of the gems installed on a particular host; an empty
 advisory response does not establish coverage for a platform-suffixed version.
 
+When `go.sum` is used, module-content rows and `/go.mod` rows for the same
+module/version contribute one inventory entry; a `/go.mod` row alone also
+contributes an entry. Distinct versions of one module remain separate entries
+and advisory queries, including superseded versions. The scanner checks for a
+nonempty `h1:` checksum field but does not validate its encoding or verify its
+digest against module contents. This inventory is neither an installed-module
+list nor a checksum-integrity assessment; a passing gate establishes neither.
+
 Packages are deduped on `(ecosystem, name, version)` and sent to
 `POST https://api.osv.dev/v1/querybatch` in chunks of 500. Each returned vuln id
 is then fetched from `GET https://api.osv.dev/v1/vulns/{id}` (cached in-memory
 per run) for severity and fixed versions.
 
-Severity: `database_specific.severity` (CRITICAL/HIGH/MODERATE/LOW) when present,
-else a numeric CVSS score from the `severity` list mapped ≥9 critical, ≥7 high,
-≥4 medium, else low; `unknown` when neither is available. A package finding takes
+Severity: a recognized `database_specific.severity` value
+(CRITICAL/HIGH/MODERATE/MEDIUM/LOW, case-insensitive) takes precedence over
+numeric scores. Otherwise the first supported numeric score in the `severity`
+list is used, mapped ≥9 critical, ≥7 high, ≥4 medium, else low; unsupported
+entries are skipped, and `unknown` is used when neither source is available.
+Within one advisory this is list order, not the highest numeric score: scores
+`4.0` followed by `9.8` produce medium, while reversing them produces critical.
+Consequently `--fail-on high` does not fire for the first ordering alone.
+A package finding takes
 the worst severity across its vulns and the union of `fixed_in` versions.
+
+Fix metadata has additional limits: for each advisory, the scanner collects
+nonempty `fixed` event values from every `affected` entry and range, without
+filtering by the queried package, ecosystem, range type, or installed version.
+It ignores `introduced`, `last_affected`, and `limit` event values. It removes
+duplicates, sorts the remaining strings lexicographically (so `10.0` precedes
+`2.0`), and retains only the first ten values per advisory. A package finding's
+`fixed_in` is the sorted, deduplicated union of those capped lists; that union
+can exceed ten values. With `--triage`, `upgrade_to` repeats this union.
+These values are advisory metadata, not a package-specific upgrade plan: they
+can include unrelated package versions or Git revisions, are not sorted by
+semantic version, and do not establish that a listed value fixes every advisory
+for the installed package. Check the original advisory and applicable release
+before choosing an upgrade.
 
 CVSS vector strings are not evaluated. An advisory with only vector strings and
 no recognized `database_specific.severity` remains `unknown`. Packages with such
@@ -916,8 +982,22 @@ advisories can still produce dependency findings, subject to finding limits;
 other rated advisories can raise a package finding's severity. `unknown` findings do not trigger `--fail-on`,
 even at `low`. A passing severity gate therefore does not clear unrated advisories.
 
-HTTP timeout is 20 s per call. Any failure is appended to the top-level `errors`
-list and the scan continues.
+HTTP timeout is 20 s per call. Request failures are appended to the top-level
+`errors` list and the scan continues. If a batch request fails, that chunk yields
+no dependency findings, while later chunks are still queried. Parsed packages
+remain in the inventory; an empty findings array does not establish that their
+advisories were checked successfully.
+
+If an advisory-detail request fails after a batch returned its ID, the scanner
+keeps that ID and uses fallback details: `unknown` severity, no fixed versions,
+and the ID as the advisory summary. This fallback is cached for the rest of the
+scan, so a shared failed advisory is fetched and recorded as an error only once.
+Subject to finding limits, affected packages still produce dependency findings.
+Other successfully loaded advisories for the same package can supply a higher
+severity and fixed versions. With only failed details, `--triage` assigns
+`monitor`, and even `--fail-on low` does not fire for the resulting `unknown`
+findings. Request errors alone do not trip the severity gate; inspect `errors`
+alongside findings and inventory before interpreting a passing exit code.
 
 ### 2. `secret`
 
@@ -1174,6 +1254,13 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   (including inline steps/checkout inputs), multiline quoted scalars and indirect
   expressions are not resolved; these forms may be missed. These checks are review
   prompts, not proof of exploitability or a complete workflow audit.
+  Job and step `if:` conditions are not evaluated: even `if: false` or
+  `if: ${{ false }}` does not suppress a matching declaration. For example, an
+  unpinned checkout in a disabled step still produces the low-severity finding;
+  a disabled PR job requesting write permissions still produces the medium one.
+  These findings remain in JSON and triage and can trigger `--fail-on` at the
+  corresponding threshold. They describe configuration text, not whether a job
+  or step will execute.
 * **No false-positive review.** Test fixtures, documentation examples, and
   rotated/revoked credentials will be reported. The only heuristic filters are
   the path rules and the value-shape hints (v0.4.1) described above; a committed
