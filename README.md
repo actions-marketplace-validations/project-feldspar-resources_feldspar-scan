@@ -105,7 +105,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.26
+- uses: project-feldspar-resources/feldspar-scan@v0.4.27
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -123,7 +123,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.26`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.27`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -176,6 +176,11 @@ An exit code of `0` means no severity gate fired; it
 does not certify a complete assessment. Review `errors`, `summary.notes`,
 `summary.lockfiles_parsed`, and `summary.packages_found` in the report.
 `--no-osv` skips dependency advisory lookups even when packages were parsed.
+Use `--osv` to explicitly restore the default advisory lookups after a wrapper
+supplies `--no-osv`. The last `--osv` or `--no-osv` flag wins. Enabling lookups
+can contact OSV.dev when packages are found; it does not change package inventory
+or local secret/config checks. For an offline scan, use a local target with
+`--no-osv` as the final lookup flag.
 
 ## Self-test
 
@@ -373,6 +378,16 @@ This recipe requires the full `findings` array; `--summary-only` output omits it
 
 Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
+For dependency findings, `evidence` displays only the first five advisory IDs in
+lookup-result order, while `vuln_ids` retains the full list sorted by ID. The
+finding `summary` includes the advisory count and only the first advisory's
+summary, limited to 120 characters. These display fields are not a complete
+advisory list or a description of the most severe advisory. Advisories omitted
+from `evidence` still contribute to severity, fix metadata, advisory counts,
+triage and severity gates. Use `vuln_ids` to review all reported advisories for
+an emitted finding; file/finding limits and lookup failures can still limit
+report coverage.
+
 Findings are sorted by severity (critical, high, medium, low, unknown), then
 category, file, line, package and summary. Missing lines sort as zero; missing
 file/package values sort as empty strings. `id` is assigned after sorting
@@ -734,6 +749,15 @@ findings do not contribute. The count is zero when no configuration files need
 review, and covers only retained findings when scan limits truncate results.
 The existing `triage_summary.config.needs_review` remains a finding count.
 This additional count does not change findings, triage actions, the hash or gate.
+
+With `--triage`, `triage_summary.config_review_by_file` maps relative file paths
+to the number of retained configuration findings needing review in each file.
+Keys are sorted alphabetically. Multiple findings in one file count separately;
+test/example/fixture paths remain included. Secret and dependency findings and
+findings without a non-empty file path do not contribute. The mapping is empty
+when no configuration findings have paths. It covers only retained findings when
+limits truncate results, and remains available with `--summary-only`. This field
+does not change findings, triage actions, the hash or severity gate.
 
 With `--triage`, `triage_summary.dependency_files_needing_upgrade` counts distinct
 representative manifest paths in emitted dependency findings with an `upgrade`
@@ -1170,10 +1194,34 @@ by the Dockerfile rules.
 * `Dockerfile` base images with no tag or with `:latest` — low. Non-latest tagged images,
   full SHA-256 digest references, `scratch`, earlier stage aliases and image
   references containing `$` are excluded. A tag is not a guarantee of immutability.
+  Every `FROM` is checked, including unused build stages; leading `--name=value`
+  options such as `--platform=linux/amd64` are skipped. A registry port does not
+  count as a tag: `registry.example.invalid:5000/team/app` is flagged. The `latest`
+  tag comparison is case-sensitive (`:Latest` is excluded); `scratch` and earlier
+  stage aliases are compared case-insensitively. The digest exclusion recognizes
+  an `@sha256:` suffix with exactly 64 hexadecimal characters without verifying
+  image existence, digest integrity or trust. This is not a digest validator:
+  a non-latest tag can independently exclude a reference with a malformed digest.
+  Variables and stage dependencies are not resolved. Each matching instruction
+  produces one finding at its starting line, with the image reference omitted.
 * `Dockerfile` `ENV` / `ARG` assignments to secret-like variable names — high.
   Names such as `API_TOKEN` and `DB_PASSWORD` match; empty values, bare `ARG`
   declarations and whole-value `$VAR` / `${VAR}` references are excluded.
-  This is a name/value heuristic, not validation of a credential.
+  Names must use ASCII letters, digits and underscores, starting with a letter
+  or underscore. Matching is case-insensitive: `PASSWORD`, `PASSWD`, `SECRET`,
+  `TOKEN`, `API_KEY`, `PRIVATE_KEY`, `SECRET_KEY` or `SECRET_ACCESS_KEY` must be
+  the whole name or its suffix after an underscore. `MYTOKEN`, `TOKEN_FILE`,
+  `PASSWORD_HASH`, `APIKEY` and bare `KEY` do not match this config rule.
+  Both `ENV NAME=value` and legacy `ENV NAME value` forms are checked; multiple
+  `NAME=value` assignments in one instruction are checked independently.
+  After quote handling, only an empty value or a whole simple variable reference
+  is exempt: `${VAR:-demo}`, `${VAR}/suffix` and `prefix$VAR` remain findings.
+  Short values and placeholders such as `demo`, `changeme` and `xxxx` also remain
+  high-severity config findings; secret-pattern placeholder downgrades do not
+  apply to this rule. With `--triage` they still require `review` and can trip
+  `--fail-on high`, even with zero secret hits. Evidence omits the assigned value.
+  This is a name/value heuristic, not validation of a credential or evaluation
+  of Docker variable expansion; no finding does not establish a safe value.
 * Shell-form `Dockerfile` `RUN` with `curl` directly piped to `sh` or `bash` —
   medium. JSON exec-form instructions and indirect shell execution are not
   analyzed. This flags the command shape without fetching or running anything.
@@ -1197,6 +1245,14 @@ by the Dockerfile rules.
 * Workflows triggered by `pull_request` with workflow/job `permissions:` declaring
   `write-all` or a scope set to `write` — medium. This flags requested permissions;
   job overrides, fork restrictions and repository policy can reduce actual access.
+  The check counts explicit declarations without resolving inheritance or job
+  overrides: workflow-level `write-all` is still reported when a job sets
+  `permissions: {}` or `read-all`. Separate block-map scopes set to `write` each
+  produce a finding; a simple inline permission map produces one finding even
+  with multiple write scopes. Missing declarations do not infer permission
+  defaults. This check requires `pull_request`; `pull_request_target` alone,
+  `push`, and other triggers do not activate it. Absence of this finding does
+  not establish read-only effective access.
 * `pull_request_target` workflows where an `actions/checkout` step's `with.ref`
   uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
   `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
@@ -1261,6 +1317,15 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   These findings remain in JSON and triage and can trigger `--fail-on` at the
   corresponding threshold. They describe configuration text, not whether a job
   or step will execute.
+  The unpinned-reference check recognizes remote `owner/repo[/path]@ref` values
+  in step and reusable-workflow `uses:` declarations. Any exactly 40-character
+  hexadecimal ref (uppercase or lowercase, even all zeros) passes this shape
+  check; tags, branches, short hashes and non-hex refs produce the low-severity
+  finding. It does not fetch the ref or verify commit existence, provenance or
+  trust. Local `./` and `../` refs, `docker://` container refs and values without
+  `@ref` are outside this check, so no pin finding does not establish their safety
+  or validity. A full-shaped checkout SHA does not suppress the separate
+  `pull_request_target` PR-head checkout finding, its review triage or its gate.
 * **No false-positive review.** Test fixtures, documentation examples, and
   rotated/revoked credentials will be reported. The only heuristic filters are
   the path rules and the value-shape hints (v0.4.1) described above; a committed
@@ -1285,6 +1350,8 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   gate therefore do not establish coverage of excluded subtrees.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
+  Wildcard `==` versions (`demo==1.*`) are prefix ranges, not exact versions, and
+  are skipped too, so they appear in neither inventory nor advisory queries.
   Requirements environment markers after `;` are discarded without evaluation:
   `demo==1.0; python_version < "0"` still contributes `demo` version `1.0` to
   inventory and, when enabled, advisory queries. Extras are stripped from names
@@ -1330,7 +1397,25 @@ For `Dockerfile` and `Dockerfile.*`, config findings also cover:
 
 * `ADD` with an HTTP(S) source, including JSON operands and leading options — low.
   URLs are omitted from evidence, including user info and query strings.
+  The check matches literal `http://` or `https://` prefixes case-insensitively
+  in source operands (all operands except the last, treated as the destination).
+  It emits one finding per instruction, even with multiple remote sources.
+  Leading `--name=value` options, including `--checksum`, do not suppress it:
+  a checksum-pinned HTTP(S) source still receives the same low-severity review
+  finding and can trip `--fail-on low`. Checksums and downloaded contents are
+  not validated. Local paths, Git/SSH/FTP forms, and `$SOURCE` / `${SOURCE}`
+  references do not match this rule; variables are not expanded. A URL appearing
+  only as the destination does not match either. This is a source-shape check,
+  not validation of Docker syntax or a claim that a download is unverified.
 * Shell-form `RUN` directly piping `curl` into `sh` or `bash` — medium.
+  The check compares command basenames, so `/usr/bin/curl ... | /bin/sh`
+  also matches, including after `;`, `&&` or `||`. It emits at most one
+  pipeline finding per `RUN`. The pipe must be a single `|` token; `|&`,
+  intervening commands, wrappers such as `env`/`sudo`, and assignments before
+  `curl` are not recognized. Quoting is removed during tokenization, so a
+  quoted argument whose entire value is `|` can also trigger this heuristic
+  (for example `RUN curl '|' sh`); a finding does not establish that the shell
+  executes a pipeline. Scripts and URLs are never fetched or executed.
 * `ENV`/`ARG` assignments with nonempty values and secret-like variable names
   (for example `API_TOKEN`, `DB_PASSWORD`, `PRIVATE_KEY`, `AWS_SECRET_ACCESS_KEY`)
   — high. Only names are reported. Unset arguments, empty values and plain

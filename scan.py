@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
-Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
+Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--osv | --no-osv]
                [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
                [--sort-keys | --no-sort-keys] [--unicode-json | --ascii-json]
                [--no-timestamp] [--no-commit] [--quiet] [--summary-only | --full-report]
@@ -36,6 +36,7 @@ For local directories named -h, --help, or --version, use an explicit path:
   --summary-only omit findings and per-finding triage; keep summaries and errors.
                   Scanning, manifest_hash and severity-gate exits are unchanged.
   --full-report  include findings and optional triage (default); last report-detail flag wins.
+  --osv           enable OSV dependency advisory lookups (default); last lookup flag wins.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
@@ -96,7 +97,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.26"
+VERSION = "0.4.27"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -191,7 +192,7 @@ def parse_requirements(text):
         name, _, ver = line.partition("==")
         name = re.split(r"[\[<>!~ ]", name.strip())[0].strip()
         ver = ver.strip().strip('"\'')
-        if name and re.match(r"^[0-9][^\s,=<>!]*$", ver):
+        if name and re.match(r"^[0-9][^\s,=<>!*]*$", ver):
             out.append(("PyPI", name, ver))
     return out
 
@@ -1057,6 +1058,7 @@ def triage_findings(findings):
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
     config_review_files = set()
+    config_review_by_file = {}
     config_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     for f in findings:
         cat = f["category"]
@@ -1126,6 +1128,8 @@ def triage_findings(findings):
                 config_review += 1
                 if f.get("file"):
                     config_review_files.add(f["file"])
+                    path = f["file"]
+                    config_review_by_file[path] = config_review_by_file.get(path, 0) + 1
                 severity = f.get("severity", "unknown")
                 config_review_by_severity[severity] = config_review_by_severity.get(severity, 0) + 1
         per_id[f["id"]] = t
@@ -1146,6 +1150,7 @@ def triage_findings(findings):
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
         "config_files_needing_review": len(config_review_files),
+        "config_review_by_file": dict(sorted(config_review_by_file.items())),
         "config_review_by_severity": config_review_by_severity,
         "secret_review_by_severity": sec_review_by_severity,
         "secret_files_needing_review": len(sec_review_files),
@@ -1201,6 +1206,9 @@ def main(argv):
             if not out_path:
                 sys.stderr.write("--json requires a non-empty path" + chr(10))
                 return 2
+            i += 1
+        elif args[i] == "--osv":
+            use_osv = True
             i += 1
         elif args[i] == "--no-osv":
             use_osv = False
