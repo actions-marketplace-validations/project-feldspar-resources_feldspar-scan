@@ -51,7 +51,7 @@ checks. Save reports outside the target to avoid scanning earlier output.
 
 Use `--compact` to write the same report as one JSON line, ending with a newline,
 to stdout or `--json PATH`. Use `--pretty` to explicitly select the default
-two-space indented JSON. Use `--indent N` to select zero through eight spaces per
+two-space indented JSON. Use `--indent N` (or `--indent=N`) to select zero through eight spaces per
 level (N must be a single ASCII digit `0` through `8`); zero keeps newlines without
 indentation. The last `--compact`, `--pretty`, or `--indent N` flag wins. Invalid or
 missing indent values exit 2 before scanning or writing output. This changes only
@@ -101,7 +101,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.24
+- uses: project-feldspar-resources/feldspar-scan@v0.4.25
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -119,7 +119,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.24`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.25`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -195,6 +195,12 @@ unchanged; use a local target with `--no-osv` for offline scanning.
 
 Default top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
+
+Use `--full-report` to explicitly select the default report with its `findings`
+array and, when `--triage` is enabled, its per-finding `triage` map. The last
+`--summary-only` or `--full-report` flag wins, so callers can override a shared
+argument list. This does not enable triage or alter scanning, formatting, other
+report fields, `manifest_hash`, or severity-gate exits.
 
 Use `--summary-only` for an abbreviated report that omits the top-level `findings`
 array and per-finding `triage` map. All other fields remain, including
@@ -611,6 +617,16 @@ release availability, unique-package counts, or complete advisory coverage, and
 reflect finding limits. Findings, existing triage decisions, gates and
 `manifest_hash` are unchanged.
 
+`triage_summary.dependency_actions_by_file` maps relative representative manifest
+paths to `upgrade` and `monitor` finding counts, with both buckets present for
+each path. Paths are sorted; the map is `{}` without retained dependency
+findings. A finding counts once regardless of advisory IDs or fixed versions:
+non-empty `fixed_in` selects `upgrade`, otherwise `monitor`. These are existing
+fix-metadata classifications, not confirmation of release availability. Scaffold
+paths are included. A package found in several manifests is attributed only to
+the scanner's representative path, and scan limits can truncate these counts.
+This opt-in summary leaves findings, triage actions, hashes and gates unchanged.
+
 `triage_summary.dependency_actions_by_severity` groups emitted dependency findings
 into `upgrade` and `monitor` rows, each with raw-severity counts (`critical`,
 `high`, `medium`, `low`, `unknown`, including zeros). A finding counts once,
@@ -734,6 +750,15 @@ not confirmed false positives; review them before dismissing a finding. When
 limits truncate findings, only emitted hits count. This opt-in summary does not
 change raw findings, `manifest_hash`, or the severity gate.
 
+`triage_summary.secret_false_positives_by_file` maps relative file paths to counts
+of emitted secret findings classified as likely false positives. Keys are sorted;
+the map is `{}` when none qualify. Multiple findings on one line count separately,
+and a file may contain both informational and review-needed secrets; only the
+informational secrets count here. Counts sum to
+`triage_summary.secrets.likely_false_positive` and include only retained findings
+when scan limits apply. This is a heuristic triage aid, not confirmation that a
+file is safe; raw findings and severity gates remain unchanged.
+
 `summary.secret_files_by_rule` maps secret finding summary labels to distinct
 affected-file counts, in alphabetical label order. Repeated hits for one label
 in one file count once; the same file can count under several labels. Labels are
@@ -820,6 +845,35 @@ secret/config checks. A tree containing only unrecognized manifest filenames has
 zero inventoried packages, an empty `summary.lockfiles_parsed`, and a note that no
 supported dependency manifest was parsed; this does not assess those dependencies.
 
+For `package-lock.json`, package names in the `packages` map come from the path
+after its last `node_modules/` component, including scoped names. An entry's
+`name` metadata does not override that installed name. In the legacy
+`dependencies` tree, the dependency key supplies the name and the `version`
+string is kept literally. The scanner does not resolve npm aliases: an alias
+can therefore be queried under its installed name rather than the underlying
+package name, and a legacy `npm:...` version is not decoded. These same identities
+are retained in offline inventory with `--no-osv`. A report without dependency
+findings does not establish advisory coverage for the underlying aliased package.
+
+For `package-lock.json`, the legacy `dependencies` tree is used only when the
+`packages` map yields no package entries. An absent or empty map, a root-only
+map, or a map whose entries lack usable versions can therefore fall back to
+the legacy tree, including nested dependencies. Once the map yields even one
+package, the two sections are not merged: legacy-only packages and alternate
+legacy versions do not enter inventory or advisory queries. A partially
+recognized map can therefore leave legacy entries unassessed. This selection
+also applies to package inventory with `--no-osv`.
+
+Go manifest selection is directory-local: a `go.mod` in the selected scan file
+list suppresses only the `go.sum` beside it, not one in a child or sibling
+directory. Selection happens before parsing. An empty `go.mod`, one with no
+recognized requirements, or one that cannot be read still suppresses its
+neighboring `go.sum`; the scanner does not use `go.sum` as a parse-failure
+fallback. Conversely, a `go.mod` absent from the selected file list does not
+suppress `go.sum` merely because it exists on disk. Review
+`summary.lockfiles_parsed` and `summary.packages_found`: zero packages in these
+cases does not mean the checksum-listed dependencies were assessed.
+
 For `Gemfile.lock`, only gems listed in `GEM` sections enter the package inventory
 and RubyGems advisory lookup. Gems listed under `GIT` or `PATH` are excluded,
 even if their names and versions resemble registry gems. A lockfile containing
@@ -836,6 +890,15 @@ v1 ranges and Berry `npm:` descriptors remain supported. A lockfile containing
 only excluded descriptors can appear in `summary.lockfiles_parsed` with zero
 packages and no advisory requests. Such a report does not assess the excluded
 dependencies, including the registry packages underlying `patch:` descriptors.
+
+`Gemfile.lock` versions are kept literally, including platform suffixes such as
+`1.2.3-x86_64-linux`; the scanner does not normalize them to `1.2.3` for advisory
+lookup. The `PLATFORMS` section does not filter the inventoried `GEM` specs, so
+`synthetic-native (1.2.3)` and `synthetic-native (1.2.3-x86_64-linux)` count as two
+package/version entries and are queried separately. `PLATFORMS`, `DEPENDENCIES`
+and `BUNDLED WITH` metadata alone supply no package versions. This is lockfile
+inventory, not resolution of the gems installed on a particular host; an empty
+advisory response does not establish coverage for a platform-suffixed version.
 
 Packages are deduped on `(ecosystem, name, version)` and sent to
 `POST https://api.osv.dev/v1/querybatch` in chunks of 500. Each returned vuln id

@@ -4,7 +4,7 @@
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
                [--sort-keys | --no-sort-keys] [--unicode-json | --ascii-json]
-               [--no-timestamp] [--no-commit] [--quiet] [--summary-only]
+               [--no-timestamp] [--no-commit] [--quiet] [--summary-only | --full-report]
        scan.py --version
 
 For local directories named -h, --help, or --version, use an explicit path:
@@ -18,6 +18,7 @@ For local directories named -h, --help, or --version, use an explicit path:
   --compact       write JSON on one line, to stdout or --json PATH.
   --pretty        write two-space indented JSON (default); last formatting flag wins.
   --indent N      use N spaces per JSON level, one digit 0 through 8.
+                  Also accepts --indent=N.
                   Zero retains newlines without indentation; last formatting flag wins.
   --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-sort-keys  preserve default object-key order; last key-order flag wins.
@@ -30,6 +31,7 @@ For local directories named -h, --help, or --version, use an explicit path:
   --quiet         suppress the file-write confirmation; keep JSON, errors and gate diagnostics.
   --summary-only omit findings and per-finding triage; keep summaries and errors.
                   Scanning, manifest_hash and severity-gate exits are unchanged.
+  --full-report  include findings and optional triage (default); last report-detail flag wins.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
@@ -90,7 +92,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.24"
+VERSION = "0.4.25"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -208,6 +210,8 @@ def parse_toml_packages(text, ecosystem):
             if n and v:
                 if not isinstance(n, str) or not isinstance(v, str):
                     return []
+                if not n.strip() or not v.strip():
+                    continue
                 out.append((ecosystem, n, str(v)))
         return out
     # Older Python versions without tomllib retain the line-based fallback.
@@ -223,7 +227,8 @@ def parse_toml_packages(text, ecosystem):
         if m:
             ver = m.group(1)
         if name and ver:
-            out.append((ecosystem, name, ver))
+            if name.strip() and ver.strip():
+                out.append((ecosystem, name, ver))
             name = ver = None
     return out
 
@@ -326,7 +331,7 @@ def parse_pnpm_lock(text):
     for line in text.splitlines():
         if line.startswith("#"):
             continue  # Unindented comments do not end the packages section.
-        if re.match(r"^packages:\s*$", line):
+        if re.fullmatch(r"packages:(?:\s+#.*)?\s*", line):
             in_pkgs = True
             continue
         if in_pkgs and line and not line.startswith((" ", "\t")):
@@ -1031,6 +1036,7 @@ def triage_findings(findings):
     per_id = {}
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     files_by_action = {action: set() for action in by_action}
+    dependency_actions_by_file = {}
     dep_upgrade = dep_monitor = dep_scaffold = 0
     dependency_actions_by_ecosystem = {}
     dep_upgrade_files = set()
@@ -1043,6 +1049,7 @@ def triage_findings(findings):
     sec_review_files = set()
     secret_review_by_file = {}
     secret_fp_reasons = {}
+    secret_fp_by_file = {}
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
     config_review_files = set()
@@ -1073,6 +1080,8 @@ def triage_findings(findings):
             severity = f.get("severity", "unknown")
             counts[severity] = counts.get(severity, 0) + 1
             lock = f.get("file") or ""
+            file_actions = dependency_actions_by_file.setdefault(lock, {"upgrade": 0, "monitor": 0})
+            file_actions[t["action"]] += 1
             m = TEST_PATH_RE.search(lock)
             if m:
                 # dataset 2026-10-08: react 546/618 and next.js 120/366 vulnerable rows came from
@@ -1092,6 +1101,8 @@ def triage_findings(findings):
             is_fp, reason = _secret_false_positive(f)
             if is_fp:
                 sec_fp += 1
+                path = f["file"]
+                secret_fp_by_file[path] = secret_fp_by_file.get(path, 0) + 1
                 secret_fp_reasons[reason] = secret_fp_reasons.get(reason, 0) + 1
                 t = {"action": "informational", "likely_false_positive": True,
                      "reason": reason,
@@ -1124,6 +1135,7 @@ def triage_findings(findings):
                        "in_scaffold_lockfiles": dep_scaffold},
         "dependency_files_needing_upgrade": len(dep_upgrade_files),
         "dependency_outside_scaffold_lockfiles": outside_scaffold,
+        "dependency_actions_by_file": dict(sorted(dependency_actions_by_file.items())),
         "dependency_actions_by_severity": dependency_actions_by_severity,
         "dependency_actions_by_ecosystem": dict(sorted(dependency_actions_by_ecosystem.items())),
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
@@ -1135,6 +1147,7 @@ def triage_findings(findings):
         "secret_files_needing_review": len(sec_review_files),
         "secret_review_by_file": dict(sorted(secret_review_by_file.items())),
         "secret_false_positive_reasons": dict(sorted(secret_fp_reasons.items())),
+        "secret_false_positives_by_file": dict(sorted(secret_fp_by_file.items())),
         "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
                                      dep_scaffold, config_review),
     }
@@ -1169,6 +1182,8 @@ def main(argv):
     unicode_json = False
     i = 1
     while i < len(args):
+        if args[i].startswith("--indent="):
+            args[i:i + 1] = args[i].split("=", 1)
         if args[i].startswith("--fail-on="):
             args[i:i + 1] = args[i].split("=", 1)
         if args[i] in ("-h", "--help"):
@@ -1226,6 +1241,9 @@ def main(argv):
             i += 1
         elif args[i] == "--quiet":
             quiet = True
+            i += 1
+        elif args[i] == "--full-report":
+            summary_only = False
             i += 1
         elif args[i] == "--summary-only":
             summary_only = True
