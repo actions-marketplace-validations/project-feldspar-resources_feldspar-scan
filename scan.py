@@ -90,7 +90,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.23"
+VERSION = "0.4.24"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -351,7 +351,7 @@ def parse_pnpm_lock(text):
 def parse_go_sum(text):
     """go.sum lists EVERY module version the module graph ever touched, including superseded ones
     (dataset 2026-10-08: 1,089 of 1,099 vulnerable go.sum rows were not in go.mod). It is only used
-    when no go.mod sits beside it (v0.4); prefer parse_go_mod."""
+    when no go.mod sits beside it (v0.4); prefer the require inventory from parse_go_mod."""
     out = []
     for line in text.splitlines():
         parts = line.split()
@@ -368,7 +368,7 @@ def parse_go_sum(text):
 
 
 def parse_go_mod(text):
-    """The `require` set of go.mod = the module's build list (direct + `// indirect`, Go 1.17+)."""
+    """Read recorded go.mod requirements; ignore replace/exclude and do not resolve a build list."""
     out = []
     in_req = False
     for line in text.splitlines():
@@ -406,7 +406,7 @@ def parse_gemfile_lock(text):
         if not in_specs:
             continue
         m = re.match(r"^\s{4}([A-Za-z0-9_.\-]+) \(([^)]+)\)\s*$", line)
-        if m:
+        if m and m.group(2).strip():
             out.append(("RubyGems", m.group(1), m.group(2)))
     return out
 
@@ -436,7 +436,7 @@ def collect_packages(root, files):
         if handler is None:
             continue
         if base == "go.sum" and os.path.dirname(path) in gomod_dirs:
-            continue  # go.mod beside it is the build list; go.sum also records superseded versions
+            continue  # Prefer recorded go.mod requirements; go.sum includes superseded versions.
         text = read_text(path, 8 * 1024 * 1024)
         if text is None:
             continue
@@ -1032,6 +1032,7 @@ def triage_findings(findings):
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     files_by_action = {action: set() for action in by_action}
     dep_upgrade = dep_monitor = dep_scaffold = 0
+    dependency_actions_by_ecosystem = {}
     dep_upgrade_files = set()
     dependency_actions_by_severity = {
         action: dict.fromkeys((*SEV_ORDER, "unknown"), 0)
@@ -1040,6 +1041,7 @@ def triage_findings(findings):
     outside_scaffold = {"upgradeable": 0, "monitor_only": 0}
     sec_total = sec_fp = 0
     sec_review_files = set()
+    secret_review_by_file = {}
     secret_fp_reasons = {}
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
@@ -1063,6 +1065,10 @@ def triage_findings(findings):
                               "version, monitor the advisory, and apply any documented "
                               "mitigation. Not fixable by upgrade today.")}
                 dep_monitor += 1
+            ecosystem = f.get("ecosystem") or "unknown"
+            actions = dependency_actions_by_ecosystem.setdefault(
+                ecosystem, {"upgrade": 0, "monitor": 0})
+            actions[t["action"]] += 1
             counts = dependency_actions_by_severity[t["action"]]
             severity = f.get("severity", "unknown")
             counts[severity] = counts.get(severity, 0) + 1
@@ -1094,6 +1100,8 @@ def triage_findings(findings):
                 severity = f.get("severity", "unknown")
                 sec_review_by_severity[severity] = sec_review_by_severity.get(severity, 0) + 1
                 sec_review_files.add(f["file"])
+                path = f["file"]
+                secret_review_by_file[path] = secret_review_by_file.get(path, 0) + 1
                 t = {"action": "review", "likely_false_positive": False,
                      "note": ("In a non-test path; confirm it is not a live credential and, "
                               "if real, rotate it and purge it from history.")}
@@ -1117,6 +1125,7 @@ def triage_findings(findings):
         "dependency_files_needing_upgrade": len(dep_upgrade_files),
         "dependency_outside_scaffold_lockfiles": outside_scaffold,
         "dependency_actions_by_severity": dependency_actions_by_severity,
+        "dependency_actions_by_ecosystem": dict(sorted(dependency_actions_by_ecosystem.items())),
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
@@ -1124,6 +1133,7 @@ def triage_findings(findings):
         "config_review_by_severity": config_review_by_severity,
         "secret_review_by_severity": sec_review_by_severity,
         "secret_files_needing_review": len(sec_review_files),
+        "secret_review_by_file": dict(sorted(secret_review_by_file.items())),
         "secret_false_positive_reasons": dict(sorted(secret_fp_reasons.items())),
         "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
                                      dep_scaffold, config_review),
@@ -1377,10 +1387,13 @@ def main(argv):
         packages_by_path_context[context] += 1
 
     config_issues_by_rule = {}
+    config_issues_by_file = {}
     for f in findings:
         if f["category"] == "config":
             label = f["summary"]
             config_issues_by_rule[label] = config_issues_by_rule.get(label, 0) + 1
+            path = f["file"]
+            config_issues_by_file[path] = config_issues_by_file.get(path, 0) + 1
 
     config_lines_by_rule = {}
     for f in findings:
@@ -1478,6 +1491,7 @@ def main(argv):
                 rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
             },
             "config_issues_by_rule": dict(sorted(config_issues_by_rule.items())),
+            "config_issues_by_file": dict(sorted(config_issues_by_file.items())),
             "by_severity": by_sev,
             "files_by_severity": {severity: len(paths) for severity, paths in files_by_sev.items()},
             "highest_severity": findings[0]["severity"] if findings else None,

@@ -101,7 +101,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.23
+- uses: project-feldspar-resources/feldspar-scan@v0.4.24
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -119,7 +119,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.23`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.24`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -443,6 +443,13 @@ These labels are not stable rule IDs or credential validation; no matched values
 are included. Scan limits restrict the counts to emitted findings. This field
 does not affect `manifest_hash` or the severity gate.
 
+`summary.config_issues_by_file` counts emitted configuration findings by relative
+file path, with paths in alphabetical order. Multiple findings in one file count
+separately, including file-level findings without a line number. Paths with no
+configuration findings are omitted; no configuration findings produces `{}`.
+Counts sum to `summary.config_issues` and reflect only findings retained within
+scan limits, not complete configuration coverage.
+
 `summary.config_issues_by_rule` groups emitted configuration findings by their
 existing human-readable `summary` labels, in alphabetical order. These labels
 are not stable rule IDs. Counts sum to `summary.config_issues`; no configuration
@@ -593,6 +600,17 @@ severities, are unchanged by `--triage`, and do not affect `manifest_hash` or ga
 
 ### Triage (`--triage`)
 
+`triage_summary.dependency_actions_by_ecosystem` maps each ecosystem with retained
+dependency findings to `upgrade` and `monitor` finding counts (both keys are
+present, including zeros). Ecosystem keys are alphabetically ordered; no retained
+dependency findings yields `{}`. Missing ecosystem metadata uses `unknown`.
+Each finding counts once, regardless of advisory IDs or fixed versions; scaffold
+findings are included. These opt-in counts follow existing fix-metadata actions:
+non-empty `fixed_in` selects `upgrade`, otherwise `monitor`. They do not establish
+release availability, unique-package counts, or complete advisory coverage, and
+reflect finding limits. Findings, existing triage decisions, gates and
+`manifest_hash` are unchanged.
+
 `triage_summary.dependency_actions_by_severity` groups emitted dependency findings
 into `upgrade` and `monitor` rows, each with raw-severity counts (`critical`,
 `high`, `medium`, `low`, `unknown`, including zeros). A finding counts once,
@@ -688,6 +706,16 @@ It is zero when no secret findings need review. With scan limits reached, it
 counts only files represented in the emitted findings, not omitted files. Like
 the rest of triage, this count does not change findings, the hash, or the gate.
 
+`triage_summary.secret_review_by_file` maps relative paths to the number of
+emitted secret findings classified as `review`, with paths sorted alphabetically.
+Repeated hits in a file count separately; informational secrets and non-secret
+findings are excluded. The values sum to `triage_summary.secrets.needs_review`,
+and the number of paths equals `triage_summary.secret_files_needing_review`.
+No secrets needing review produces `{}`. This field is present only with
+`--triage`; finding limits can make the counts partial. The classifications are
+heuristics, not confirmation that credentials are live. The field adds no raw
+values and does not change findings, the hash, or the severity gate.
+
 With `--triage`, `triage_summary.dependency_outside_scaffold_lockfiles`
 contains `upgradeable` and `monitor_only` counts for emitted dependency findings
 whose source paths do not match the existing test/example/fixture scaffold
@@ -764,12 +792,50 @@ sources differ. A registry advisory match does not establish that a fork or loca
 package contains the affected code. Check the source before acting on that match.
 `--no-osv` retains this inventory but skips advisory lookup.
 
+For `package-lock.json`, package inventory does not filter on `dev`, `optional`,
+`devOptional`, `os`, or `cpu` metadata. Entries with these fields can enter npm
+advisory lookup from both the `packages` map and the fallback `dependencies` tree,
+including nested dependencies of development-only packages. This is a static
+lockfile inventory, not the packages installed by `npm ci --omit=dev` or on the
+current operating system and CPU. `--no-osv` keeps this inventory but skips
+advisory queries; a finding does not establish production installation or reachability.
+
+For `pnpm-lock.yaml`, inventory comes from recognized keys in `packages:`, without
+resolving the dependency graph in `importers:` or `snapshots:`. A recognized package
+can enter npm advisory lookup even when no importer references it or its metadata
+marks it development-only, optional, or specific to another OS/CPU. Entries found
+only in importers or snapshots do not supply inventory. Parenthesized peer-context
+suffixes are removed from package keys; entries with the same name and version
+then count once, rather than once per peer context. `--no-osv` preserves this
+inventory but skips advisory queries. These counts do not establish which packages
+are installed or reachable; a parsed lockfile can still yield zero packages.
+
+Dependency discovery matches these basenames exactly and case-sensitively at
+any scanned directory depth; `requirements*.txt` is the prefix/suffix exception.
+For example, `Package-lock.json`, `package-lock.json.bak`, and `Requirements.txt`
+do not supply inventory. Neither do `package.json`, `npm-shrinkwrap.json`,
+`Pipfile.lock`, `pyproject.toml`, or `composer.lock`: their dependency declarations
+are not parsed or sent for advisory lookup. Such files may still receive local
+secret/config checks. A tree containing only unrecognized manifest filenames has
+zero inventoried packages, an empty `summary.lockfiles_parsed`, and a note that no
+supported dependency manifest was parsed; this does not assess those dependencies.
+
 For `Gemfile.lock`, only gems listed in `GEM` sections enter the package inventory
 and RubyGems advisory lookup. Gems listed under `GIT` or `PATH` are excluded,
 even if their names and versions resemble registry gems. A lockfile containing
 only those excluded sources can still appear in `summary.lockfiles_parsed`
 while contributing zero packages and causing no advisory requests. A clean
 report therefore does not assess the excluded Git or local-path dependencies.
+
+For `yarn.lock`, descriptors using `workspace:`, `patch:`, `portal:`, `link:`,
+`file:`, `exec:`, `git:`, `github:`, `http:` or `https:` are excluded from package
+inventory and advisory queries, even when their entries contain numeric versions.
+This filter applies to each descriptor in a comma-separated list; a recognized
+registry descriptor in the same list can still contribute a package. Ordinary
+v1 ranges and Berry `npm:` descriptors remain supported. A lockfile containing
+only excluded descriptors can appear in `summary.lockfiles_parsed` with zero
+packages and no advisory requests. Such a report does not assess the excluded
+dependencies, including the registry packages underlying `patch:` descriptors.
 
 Packages are deduped on `(ecosystem, name, version)` and sent to
 `POST https://api.osv.dev/v1/querybatch` in chunks of 500. Each returned vuln id
@@ -1076,10 +1142,15 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   resolution. Duplicate package/version pins count once, while distinct pinned
   versions remain even under mutually exclusive markers. This is a static
   inventory, not the resolved installation for the current interpreter or platform.
-* Go: `go.mod`'s `require` set (direct + indirect) is the build list and is what
-  gets queried; `go.sum` is only read when no `go.mod` sits beside it, because it
-  also records superseded module versions (v0.4 — the 2026-10-08 dataset showed
-  99% of `go.sum` hits were not in `go.mod`). No call-graph reachability: use
+* Go: the scanner queries the module paths and versions recorded in `go.mod`
+  `require` entries (direct + indirect), not a resolved build list. It ignores
+  `replace` and `exclude` directives: a replaced or excluded requirement still
+  enters inventory and, when enabled, advisory lookup under its original path
+  and version. Replacement targets are not followed or substituted; directives
+  alone add no packages. No Go toolchain or module-graph resolution is run.
+  `go.sum` is only read when no `go.mod` sits beside it, because it also records
+  superseded module versions (v0.4 — the 2026-10-08 dataset showed 99% of
+  `go.sum` hits were not in `go.mod`). No call-graph reachability: use
   `govulncheck` for that.
 * Yarn v1 and Yarn Berry (v2+) lockfiles are parsed (Berry since v0.4; workspace/
   patch/portal entries are skipped). `composer.lock`, Maven/Gradle and NuGet are not.
