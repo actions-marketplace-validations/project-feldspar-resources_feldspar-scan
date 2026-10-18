@@ -3,7 +3,7 @@
 
 Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
                [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
-               [--sort-keys | --no-sort-keys] [--unicode-json]
+               [--sort-keys | --no-sort-keys] [--unicode-json | --ascii-json]
                [--no-timestamp] [--no-commit] [--quiet] [--summary-only]
        scan.py --version
 
@@ -23,6 +23,7 @@ For local directories named -h, --help, or --version, use an explicit path:
   --no-sort-keys  preserve default object-key order; last key-order flag wins.
   --unicode-json  retain non-ASCII characters in JSON (default: escape them).
                   Named files use UTF-8; stdout needs a Unicode-capable encoding.
+  --ascii-json    escape non-ASCII characters (default); last encoding flag wins.
   --no-timestamp  omit scanned_at from JSON; other report fields are unchanged.
   --no-commit     skip Git HEAD lookup; report commit as null (also used in manifest_hash).
                   URL targets still clone; this does not disable network access.
@@ -89,7 +90,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.22"
+VERSION = "0.4.23"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -172,6 +173,8 @@ def redact(value, n=4):
 # ------------------------------------------------------------ dep parsers
 def parse_requirements(text):
     out = []
+    if text.startswith("\ufeff"):
+        text = text[1:]  # A UTF-8 signature is not part of a package name or option.
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if not line or line.startswith("-"):
@@ -260,7 +263,7 @@ def parse_package_lock(text):
             name, meta = item
             if isinstance(meta, dict):
                 ver = meta.get("version")
-                if isinstance(ver, str) and ver:
+                if name and isinstance(ver, str) and ver:
                     out.append(("npm", name, ver))
                 if isinstance(meta.get("dependencies"), dict):
                     stack.append(iter(meta["dependencies"].items()))
@@ -1185,6 +1188,9 @@ def main(argv):
         elif args[i] == "--unicode-json":
             unicode_json = True
             i += 1
+        elif args[i] == "--ascii-json":
+            unicode_json = False
+            i += 1
         elif args[i] == "--pretty":
             compact = False
             json_indent = 2
@@ -1303,8 +1309,12 @@ def main(argv):
     findings_by_path_context = {"scaffold": 0, "other": 0}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
+    secret_hits_by_file = {}
+    advisories_by_ecosystem = {}
     dependency_findings_by_advisory = {}
+    dependency_files_by_advisory = {}
     dependency_findings_by_ecosystem = {}
+    dependency_findings_by_manifest = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
         context = "scaffold" if TEST_PATH_RE.search(f["file"]) else "other"
@@ -1315,11 +1325,17 @@ def main(argv):
         if f["category"] == "dependency-vuln":
             ecosystem = f["ecosystem"]
             dependency_findings_by_ecosystem[ecosystem] = dependency_findings_by_ecosystem.get(ecosystem, 0) + 1
+            manifest = f["file"]
+            dependency_findings_by_manifest[manifest] = dependency_findings_by_manifest.get(manifest, 0) + 1
         if f["category"] == "secret":
+            path = f["file"]
+            secret_hits_by_file[path] = secret_hits_by_file.get(path, 0) + 1
             label = f["summary"]
             secret_hits_by_rule[label] = secret_hits_by_rule.get(label, 0) + 1
         if f["category"] == "dependency-vuln":
             for advisory in set(f["vuln_ids"]):
+                dependency_files_by_advisory.setdefault(advisory, set()).add(f["file"])
+                advisories_by_ecosystem.setdefault(f["ecosystem"], set()).add(advisory)
                 dependency_findings_by_advisory[advisory] = (
                     dependency_findings_by_advisory.get(advisory, 0) + 1)
         # Findings are already sorted from highest to lowest severity.
@@ -1334,6 +1350,18 @@ def main(argv):
     packages_by_ecosystem = {}
     for ecosystem, _, _ in sorted(pkgs):
         packages_by_ecosystem[ecosystem] = packages_by_ecosystem.get(ecosystem, 0) + 1
+
+    package_versions = {}
+    for ecosystem, name, version in sorted(pkgs):
+        package_versions.setdefault((ecosystem, name), []).append(version)
+    multi_version_packages = {}
+    for (ecosystem, name), versions in package_versions.items():
+        if len(versions) > 1:
+            multi_version_packages.setdefault(ecosystem, {})[name] = versions
+
+    package_names_by_ecosystem = {}
+    for ecosystem, name, _ in sorted(pkgs):
+        package_names_by_ecosystem.setdefault(ecosystem, set()).add(name)
 
     vulnerable_packages_by_ecosystem = {}
     for ecosystem, _, _ in sorted(vulnerable):
@@ -1397,6 +1425,10 @@ def main(argv):
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
             "packages_by_ecosystem": packages_by_ecosystem,
+            "multi_version_packages": multi_version_packages,
+            "package_names_by_ecosystem": {
+                ecosystem: len(names) for ecosystem, names in package_names_by_ecosystem.items()
+            },
             "packages_by_path_context": packages_by_path_context,
             "packages_by_manifest": packages_by_manifest,
             "vulnerable_packages": len(vulnerable),
@@ -1410,16 +1442,26 @@ def main(argv):
                 for ecosystem, paths in sorted(dependency_files_by_ecosystem.items())
             },
             "dependency_findings_by_ecosystem": dict(sorted(dependency_findings_by_ecosystem.items())),
+            "dependency_findings_by_manifest": dict(sorted(dependency_findings_by_manifest.items())),
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"
                                       for vid in f["vuln_ids"]}),
+            "unique_advisories_by_ecosystem": {
+                ecosystem: len(advisories)
+                for ecosystem, advisories in sorted(advisories_by_ecosystem.items())
+            },
             "dependency_findings_by_advisory": dict(sorted(dependency_findings_by_advisory.items())),
+            "dependency_files_by_advisory": {
+                advisory: len(paths)
+                for advisory, paths in sorted(dependency_files_by_advisory.items())
+            },
             "osv_enabled": use_osv,
             "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "secret_lines": len({(f["file"], f["line"]) for f in findings
                                  if f["category"] == "secret"}),
             "secret_hits_by_rule": dict(sorted(secret_hits_by_rule.items())),
+            "secret_hits_by_file": dict(sorted(secret_hits_by_file.items())),
             "secret_files_by_rule": {
                 rule: len(paths) for rule, paths in sorted(secret_files_by_rule.items())
             },

@@ -72,7 +72,9 @@ output and changes only serialization; the default still escapes non-ASCII
 characters. Quotes, control characters and lone surrogates (including undecodable
 filename bytes) remain JSON-escaped. Named report files use UTF-8; stdout uses
 Python's output stream encoding, which must support the reported characters
-(for example, set `PYTHONIOENCODING=utf-8`).
+(for example, set `PYTHONIOENCODING=utf-8`). Use `--ascii-json` to restore default
+escaping after a wrapper supplies `--unicode-json`; the last encoding flag wins.
+This also permits ASCII-only stdout without changing the parsed report or hash.
 
 Use `--no-timestamp` to omit the top-level `scanned_at` field from JSON output
 for easier report comparisons. The timestamp remains present by default. This
@@ -99,7 +101,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.22
+- uses: project-feldspar-resources/feldspar-scan@v0.4.23
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -117,7 +119,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.22`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.23`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -245,6 +247,14 @@ encountered before traversal stops, including the extra candidate used to detect
 the file limit; it is not a total of all omitted files. Zero does not establish
 complete coverage. Skips alone do not trip the severity gate.
 
+`summary.secret_hits_by_file` maps relative paths to counts of retained secret
+findings, in sorted path order. Repeated hits on the same line count separately;
+config and dependency findings do not contribute. Only paths with secret findings
+appear, and no retained secrets produces `{}`. Counts sum to `summary.secret_hits`,
+include low-severity hints, and can be reduced by finding caps. They do not prove
+that credentials are real or that scanning was complete. This summary does not
+change findings, gates, triage, or `manifest_hash`.
+
 `summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
 lookups, and `true` otherwise. It records the selected mode, not lookup success:
 check `errors`, `summary.packages_found`, and `summary.lockfiles_parsed` for
@@ -257,6 +267,28 @@ entries for each observed ecosystem, in sorted ecosystem order. Its counts sum t
 different versions count separately. Empty inventory produces `{}`. These are
 inventory counts, including with `--no-osv`, not advisory counts or proof of a
 complete assessment. File limits bound this inventory; finding limits do not.
+
+`summary.multi_version_packages` maps ecosystems to package names to lists of
+versions, including only names with multiple distinct versions in that ecosystem's
+parsed inventory. For example, `{"PyPI": {"demo": ["1.0", "2.0"]}}` means both
+versions were found; duplicates across manifests count once. Ecosystems, names,
+and version strings are ordered lexicographically, not by semantic version.
+Names and versions use the existing parsers' normalization; ecosystems remain
+separate. No multi-version names produces `{}`. This works with `--no-osv` and is
+unaffected by finding caps, but file limits and parser coverage bound the inventory.
+Multiple versions can be intentional and do not establish a vulnerability or a
+resolution conflict. This field adds no findings and does not affect severity gates
+or `manifest_hash`.
+
+`summary.package_names_by_ecosystem` counts distinct parsed package names in each
+ecosystem, ignoring repeated versions and manifests. Names use the existing
+parsers' spelling and normalization; scoped npm names remain distinct from
+unscoped names. Keys are alphabetically ordered, and an empty inventory yields
+`{}`. Unlike `summary.packages_by_ecosystem` (package/version pairs), multiple
+versions of one name count once here. Counts remain available with `--no-osv`
+and are independent of finding limits, but file limits and parser scope still
+apply. They do not establish complete dependency coverage or vulnerability
+status, and do not affect `manifest_hash`.
 
 `summary.vulnerable_packages_by_ecosystem` counts unique vulnerable
 `(ecosystem, name, version)` entries returned by OSV, grouped in sorted ecosystem
@@ -375,6 +407,16 @@ this does not certify coverage (review OSV status, errors and truncation). Triag
 and severity gates do not filter these counts. This field does not affect
 `manifest_hash`.
 
+`summary.dependency_findings_by_manifest` counts emitted dependency findings per
+representative manifest path, with paths sorted lexicographically. Each finding
+counts once even when it lists multiple advisory IDs; other finding categories
+do not contribute. A package/version shared by multiple manifests is attributed
+only to its selected representative path, not every manifest containing it.
+Paths without retained dependency findings are omitted; an empty result is `{}`.
+The counts sum to `summary.by_category["dependency-vuln"]` and reflect finding
+limits. They do not certify advisory coverage; review OSV status, errors and
+truncation. Triage, severity gates and `manifest_hash` are unchanged.
+
 `summary.dependency_findings_with_fixes` counts emitted dependency findings with
 at least one reported `fixed_in` version. Each package/version finding counts
 once, even with multiple advisories or fixed versions. This counts reported fix
@@ -426,6 +468,16 @@ Zero means no advisory IDs were emitted, including with `--no-osv`; it does not
 certify coverage or successful lookups. Check errors, notes and truncation flags.
 This summary field does not affect `manifest_hash`.
 
+`summary.unique_advisories_by_ecosystem` maps each ecosystem to its count of
+distinct advisory ID strings in retained dependency findings, with ecosystem
+keys sorted alphabetically. Repeated IDs across packages, versions and files
+count once within an ecosystem. An ID shared across ecosystems counts in each,
+so these counts can sum to more than `summary.unique_advisories`. Different IDs
+remain separate even if they are aliases. Ecosystems without emitted advisory
+IDs are omitted; no emitted IDs produces `{}`, including with `--no-osv`.
+File and finding limits bound these counts; they do not establish coverage or
+successful lookups. Findings, triage, gates and `manifest_hash` are unchanged.
+
 `summary.dependency_findings_by_advisory` maps each advisory ID to the number of
 emitted dependency findings referencing it, with keys sorted alphabetically.
 Repeated IDs within one finding count once; distinct package versions and
@@ -437,6 +489,17 @@ may reference several advisories. Counts include only findings retained after
 limits, and no emitted dependency findings produces `{}`, including with
 `--no-osv`. This is not a coverage guarantee. Findings, gates, triage and
 `manifest_hash` are unchanged by this summary.
+
+`summary.dependency_files_by_advisory` maps each advisory ID to the number of
+distinct representative manifest paths in its emitted dependency findings, with
+keys sorted alphabetically. Several packages or versions sharing an advisory in
+one file count once; the same advisory in two representative paths counts twice.
+Package deduplication selects one representative path per ecosystem/name/version,
+so this is not a count of every manifest containing an affected package.
+Different advisory IDs remain separate even when they are aliases. Counts use
+only findings retained after limits; no emitted dependency findings produces
+`{}`, including with `--no-osv`. Zero is not a coverage guarantee. This field
+does not change findings, gates, triage or `manifest_hash`.
 
 `--fail-on SEV` and `--fail-on=SEV` accept case-insensitive values. When repeated,
 the last value wins across both spellings: `--fail-on HIGH --fail-on=none`
@@ -679,6 +742,27 @@ Manifests/lockfiles parsed (files under `node_modules/`, `vendor/`, `.git/`,
 | `go.mod` | Go | the `require` build list (direct + `// indirect`); preferred over `go.sum` (v0.4) |
 | `go.sum` | Go | only when no `go.mod` sits beside it (go.sum also lists superseded versions); `/go.mod` suffix stripped |
 | `Gemfile.lock` | RubyGems | `specs:` within `GEM` sections only, `    name (1.2.3)`; `GIT`/`PATH` specs excluded |
+
+Requirements files are discovered by case-sensitive basename: any name starting
+with `requirements` and ending with `.txt`, at any included directory depth.
+For example, `requirements-dev.txt` and `nested/requirements_extra.txt` qualify;
+`Requirements.txt`, `requirements.in`, `constraints.txt`, and `base.txt` do not.
+Pip include and constraint directives (`-r`/`--requirement`, `-c`/`--constraint`)
+are ignored, not followed. Referencing `base.txt` therefore does not inventory
+its pins. A matching `requirements*.txt` file is discovered independently even
+when no directive references it, subject to the usual directory and file limits.
+A directive-only `requirements.txt` can appear in `summary.lockfiles_parsed`
+with zero packages; that does not assess the dependencies in its include targets.
+
+For `poetry.lock`, `uv.lock`, and `Cargo.lock`, the TOML reader uses package
+name/version pairs without inspecting source metadata. Git, local/editable, and
+source-less entries with a supported name/version pair can therefore enter the
+inventory and advisory lookup as PyPI or crates.io packages, according to the
+filename. Source URLs and revisions are not sent in those queries; entries with
+the same ecosystem, name, and version collapse into one identity even when their
+sources differ. A registry advisory match does not establish that a fork or local
+package contains the affected code. Check the source before acting on that match.
+`--no-osv` retains this inventory but skips advisory lookup.
 
 For `Gemfile.lock`, only gems listed in `GEM` sections enter the package inventory
 and RubyGems advisory lookup. Gems listed under `GIT` or `PATH` are excluded,
