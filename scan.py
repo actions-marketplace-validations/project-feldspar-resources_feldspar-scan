@@ -6,6 +6,7 @@ Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--osv | --n
                [--sort-keys | --no-sort-keys] [--unicode-json | --ascii-json]
                [--no-timestamp] [--no-commit] [--quiet] [--summary-only | --full-report]
                [--timestamp] [--commit] [--no-quiet]
+               [--tab-indent]
        scan.py --version
 
 For local directories named -h, --help, or --version, use an explicit path:
@@ -21,6 +22,7 @@ For local directories named -h, --help, or --version, use an explicit path:
   --indent N      use N spaces per JSON level, one digit 0 through 8.
                   Also accepts --indent=N.
                   Zero retains newlines without indentation; last formatting flag wins.
+  --tab-indent    use one tab per JSON level; last formatting flag wins.
   --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-sort-keys  preserve default object-key order; last key-order flag wins.
   --unicode-json  retain non-ASCII characters in JSON (default: escape them).
@@ -97,7 +99,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.27"
+VERSION = "0.4.28"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -287,6 +289,8 @@ def parse_yarn_lock(text):
     """Yarn v1 (`name@^1.0.0:` / `  version "1.0.0"`) and Yarn Berry v2+ (`"name@npm:^1.0.0":` /
     `  version: 1.0.0`, `__metadata:` header). Workspace/patch/portal entries are not registry packages
     and are skipped (v0.4 — before this, Berry lockfiles silently yielded 0 packages)."""
+    if text.startswith("\ufeff"):
+        text = text[1:]  # A UTF-8 signature is not part of the first descriptor.
     out = []
     names = []
     for line in text.splitlines():
@@ -1232,6 +1236,10 @@ def main(argv):
             compact = False
             json_indent = 2
             i += 1
+        elif args[i] == "--tab-indent":
+            compact = False
+            json_indent = "\t"
+            i += 1
         elif args[i] == "--indent":
             if i + 1 >= len(args) or re.fullmatch(r"[0-8]", args[i + 1]) is None:
                 sys.stderr.write("--indent must be one digit from 0 to 8" + chr(10))
@@ -1356,6 +1364,7 @@ def main(argv):
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     findings_by_path_context = {"scaffold": 0, "other": 0}
+    finding_lines_by_file = {}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
     secret_hits_by_file = {}
@@ -1366,6 +1375,8 @@ def main(argv):
     dependency_findings_by_manifest = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
+        if f["line"] is not None:
+            finding_lines_by_file.setdefault(f["file"], set()).add(f["line"])
         context = "scaffold" if TEST_PATH_RE.search(f["file"]) else "other"
         findings_by_path_context[context] += 1
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
@@ -1462,8 +1473,12 @@ def main(argv):
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "total_findings": len(findings),
+            "findings_without_line": sum(1 for f in findings if f["line"] is None),
             "finding_lines": len({(f["file"], f["line"]) for f in findings
                                   if f["line"] is not None}),
+            "finding_lines_by_file": {
+                path: len(lines) for path, lines in sorted(finding_lines_by_file.items())
+            },
             "findings_by_path_context": findings_by_path_context,
             "files_scanned": len(files),
             "files_without_findings": sum(

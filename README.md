@@ -53,7 +53,8 @@ Use `--compact` to write the same report as one JSON line, ending with a newline
 to stdout or `--json PATH`. Use `--pretty` to explicitly select the default
 two-space indented JSON. Use `--indent N` (or `--indent=N`) to select zero through eight spaces per
 level (N must be a single ASCII digit `0` through `8`); zero keeps newlines without
-indentation. The last `--compact`, `--pretty`, or `--indent N` flag wins. Invalid or
+indentation. Use `--tab-indent` for one tab per JSON nesting level. The last
+`--compact`, `--pretty`, `--indent N`, or `--tab-indent` flag wins. Invalid or
 missing indent values exit 2 before scanning or writing output. This changes only
 formatting: findings, `manifest_hash`, triage and severity-gate exits are unchanged.
 
@@ -105,7 +106,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.27
+- uses: project-feldspar-resources/feldspar-scan@v0.4.28
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -123,7 +124,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.27`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.28`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -243,7 +244,7 @@ truncation flags and OSV mode as well. Error reporting does not change findings,
 symlink exclusions, up to the file limit. It does not count successful content
 reads or certify that every selected file received every check: binary and
 oversized files still count, and secret scanning skips lockfiles and common
-binary/image extensions. Excluded directories and symlinks do not count. When
+binary/image extensions. Excluded child directories and symlink entries do not count. When
 `summary.truncated.files` is true, additional candidate files were omitted.
 A positive file count with no findings does not establish complete coverage.
 
@@ -274,6 +275,14 @@ appear, and no retained secrets produces `{}`. Counts sum to `summary.secret_hit
 include low-severity hints, and can be reduced by finding caps. They do not prove
 that credentials are real or that scanning was complete. This summary does not
 change findings, gates, triage, or `manifest_hash`.
+
+These symlink exclusions apply to entries encountered **beneath** the selected
+target. An explicitly supplied local target that is a symlink to a directory is
+followed: its regular descendants are scanned and counted normally, while links
+encountered inside it are still skipped. The target alias itself does not add to
+`summary.skipped_non_regular` or `summary.files_scanned`. The report retains the
+supplied target spelling, and finding paths are relative to that target; it does
+not replace the reported target with the resolved directory path.
 
 `summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
 lookups, and `true` otherwise. It records the selected mode, not lookup success:
@@ -417,6 +426,13 @@ of `findings`; a dependency finding with multiple advisories counts once. Scan
 limits restrict these counts to retained findings, and the mapping does not
 change with `--triage` or affect `manifest_hash`.
 
+`summary.findings_without_line` counts emitted findings whose `line` is `null`,
+such as dependency findings and the missing Dockerfile USER warning. It counts
+findings, not files or advisory IDs: two dependency findings in one manifest
+count twice. Empty reports and reports containing only located findings yield
+zero. Only findings retained after caps count; this field remains available with
+`--summary-only`. It does not change findings, triage, gates or `manifest_hash`.
+
 `summary.finding_lines` counts distinct `(file, line)` locations across all
 emitted findings with a non-null line number. Multiple rules or categories on
 one line count once; equal line numbers in different files count separately.
@@ -425,6 +441,12 @@ Dockerfile USER check, are excluded. Empty or entirely unlocated reports yield
 zero. This counts retained finding locations after limits, not lines scanned,
 all affected files, or source coverage. Triage does not filter the count;
 findings, severity gates and `manifest_hash` are unchanged.
+
+`summary.finding_lines_by_file` breaks that count down by relative file path,
+with paths sorted lexically. Each value counts distinct retained non-null line
+numbers across all rules and categories in that file. Paths with only unlocated
+findings are omitted; an empty or entirely unlocated report yields `{}`. Values
+sum to `summary.finding_lines`, including when `--summary-only` omits the findings.
 
 `summary.files_with_findings_by_category` counts distinct relative file paths for
 each of `dependency-vuln`, `secret`, and `config`, including zero counts. Repeated
@@ -1222,9 +1244,24 @@ by the Dockerfile rules.
   `--fail-on high`, even with zero secret hits. Evidence omits the assigned value.
   This is a name/value heuristic, not validation of a credential or evaluation
   of Docker variable expansion; no finding does not establish a safe value.
+  Instructions in earlier stages also count; reported locations use the first
+  line of a continued instruction, and evidence omits the value. An excluded
+  assignment is not a guarantee that other scanner rules ignore its contents.
 * Shell-form `Dockerfile` `RUN` with `curl` directly piped to `sh` or `bash` —
   medium. JSON exec-form instructions and indirect shell execution are not
   analyzed. This flags the command shape without fetching or running anything.
+  Dockerfile configuration checks use a bounded logical-instruction heuristic,
+  not a full Dockerfile or shell parser. Backslash continuations (or backticks
+  with a recognized `# escape=` directive) join physical lines; findings for a
+  joined instruction point to its first physical line. Blank lines and full-line
+  comments are skipped, including inside a continuation. Recognized named
+  heredocs on `RUN`, `COPY`, and `ADD` skip their bodies and delimiter lines:
+  instruction-looking text in a body is not checked as Dockerfile configuration.
+  Simple unquoted or matching-quoted delimiter names are supported, including
+  tab-stripping `<<-` and multiple delimiters; general shell syntax is not parsed.
+  These exclusions apply only to configuration checks. The separate secret pass
+  still examines eligible comment and heredoc-body lines, so those lines can
+  produce secret findings and trip a severity gate.
 * `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` / `compose.yaml` containing a plain
   `privileged: true` declaration — medium. The key may be unquoted or enclosed in
   matching single or double quotes; the value must remain plain `true`.
@@ -1242,6 +1279,15 @@ by the Dockerfile rules.
 * `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs
   that are not full 40-character hexadecimal commit SHAs — low. Includes
   `actions/*`; local `./` actions and `docker://` references are excluded.
+  All workflow config checks select only direct children of `.github/workflows`
+  relative to the scan target, with case-sensitive directory names and lowercase
+  `.yml` or `.yaml` extensions. Files in subdirectories of `workflows`, workflows
+  inside nested repositories, and files such as `build.YML` are not selected.
+  Scanning a nested repository as the target selects its own `.github/workflows`
+  children; scanning `.github/workflows` itself does not. Otherwise eligible
+  files outside this selection still receive independent secret-pattern scanning.
+  Absence of workflow config findings does not establish that a file was checked
+  by these rules.
 * Workflows triggered by `pull_request` with workflow/job `permissions:` declaring
   `write-all` or a scope set to `write` — medium. This flags requested permissions;
   job overrides, fork restrictions and repository policy can reduce actual access.
@@ -1262,6 +1308,14 @@ by the Dockerfile rules.
   inside other option names, values, or trailing comments do not count.
   `.pypirc` retains the exact `_authToken=` substring check and the anchored
   spaced-key form, as well as the `password` rule.
+  In both files, `_authToken` matching is case-sensitive and requires `=`;
+  `_AUTHTOKEN=x` and `_authToken: x` do not trigger this config check.
+  The `password` key is case-insensitive, must begin the line after optional
+  whitespace, and accepts `:` or `=` after optional whitespace (for example,
+  `PassWord : x`). Names such as `db_password` and `password_extra` do not match.
+  Ignored lines do not prevent a later qualifying line from being reported.
+  These are scanner selection rules, not a full interpretation of package-manager
+  configuration; independently eligible secret patterns can still be reported.
   Empty or whitespace-only `password=` / `password:` fields are ignored;
   later credential lines are still checked. Quoted values and inline comments
   after the delimiter remain nonempty for this conservative heuristic.
@@ -1427,6 +1481,19 @@ For `Dockerfile` and `Dockerfile.*`, config findings also cover:
   with a literal group (`root:app`, `0:1000`) — low. Earlier stages and overridden
   users are excluded. Variable-based users, inherited image users, and user-name
   to UID mappings are not resolved; a root group alone does not trigger this check.
+  The check matches the literal, case-sensitive instruction value: `ROOT`, `00`,
+  quoted `"root"`, and `root # comment` are not recognized as explicit root.
+  A group suffix must be nonempty and contain only ASCII letters, digits,
+  underscores, periods or hyphens. These exclusions do not establish a non-root
+  runtime identity.
+
+The missing-`USER` rule emits one low finding with a null source line only when
+no parsed `USER` instruction appears anywhere in the file. For example,
+`FROM scratch AS builder`, `USER root`, then `FROM builder` produces neither
+USER finding: the earlier instruction suppresses the whole-file missing-user
+check, while the final stage has no explicit user to match. The scanner does not
+resolve user inheritance from a prior stage or an image. For an explicit final
+root user continued across lines, the finding points to the first physical line.
 
 These are bounded syntax heuristics. Continuations retain the first physical
 line number, comments and simple named heredoc bodies are skipped, and malformed
