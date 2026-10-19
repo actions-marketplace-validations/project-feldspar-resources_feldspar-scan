@@ -99,7 +99,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.28"
+VERSION = "0.4.29"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -1361,9 +1361,12 @@ def main(argv):
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
     files_by_sev = {severity: set() for severity in by_sev}
+    finding_lines_by_sev = {severity: set() for severity in by_sev}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     findings_by_path_context = {"scaffold": 0, "other": 0}
+    finding_files_by_path_context = {context: set() for context in findings_by_path_context}
+    finding_lines_by_path_context = {context: set() for context in findings_by_path_context}
     finding_lines_by_file = {}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
@@ -1379,8 +1382,13 @@ def main(argv):
             finding_lines_by_file.setdefault(f["file"], set()).add(f["line"])
         context = "scaffold" if TEST_PATH_RE.search(f["file"]) else "other"
         findings_by_path_context[context] += 1
+        finding_files_by_path_context[context].add(f["file"])
+        if f["line"] is not None:
+            finding_lines_by_path_context[context].add((f["file"], f["line"]))
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         files_by_sev.setdefault(f["severity"], set()).add(f["file"])
+        if f["line"] is not None:
+            finding_lines_by_sev.setdefault(f["severity"], set()).add((f["file"], f["line"]))
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
         if f["category"] == "dependency-vuln":
             ecosystem = f["ecosystem"]
@@ -1476,15 +1484,30 @@ def main(argv):
             "findings_without_line": sum(1 for f in findings if f["line"] is None),
             "finding_lines": len({(f["file"], f["line"]) for f in findings
                                   if f["line"] is not None}),
+            "finding_lines_by_category": {
+                category: len({(f["file"], f["line"]) for f in findings
+                               if f["category"] == category and f["line"] is not None})
+                for category in by_category
+            },
+            "finding_lines_by_severity": {
+                severity: len(locations) for severity, locations in finding_lines_by_sev.items()
+            },
             "finding_lines_by_file": {
                 path: len(lines) for path, lines in sorted(finding_lines_by_file.items())
             },
             "findings_by_path_context": findings_by_path_context,
+            "files_with_findings_by_path_context": {
+                context: len(paths) for context, paths in finding_files_by_path_context.items()
+            },
+            "finding_lines_by_path_context": {
+                context: len(locations) for context, locations in finding_lines_by_path_context.items()
+            },
             "files_scanned": len(files),
             "files_without_findings": sum(
                 1 for path in files if os.path.relpath(path, root) not in findings_per_file),
             "files_with_findings": len({f["file"] for f in findings}),
             "findings_by_file": dict(sorted(findings_per_file.items())),
+            "files_with_multiple_findings": sum(count >= 2 for count in findings_per_file.values()),
             "files_with_findings_by_category": {
                 category: len({f["file"] for f in findings if f["category"] == category})
                 for category in by_category

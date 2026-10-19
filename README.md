@@ -41,6 +41,13 @@ The equivalent inline form `--json=PATH` accepts a non-empty path, including
 `--json="report folder/result=a.json"`; equals signs within the path are preserved.
 An empty `--json=` is an argument error (exit 2) before scanning or cloning.
 
+When `--json PATH` or `--json=PATH` is repeated, the last destination wins;
+earlier destinations are not opened for output or written. For example,
+`--json unused.json --json=-` prints only to stdout, while
+`--json=- --json final.json` writes only `final.json`. This also lets a wrapper's
+output destination be overridden. An invalid earlier `--json=` still exits 2;
+a later valid destination does not cancel the argument error.
+
 For either spelling, a relative output path is resolved from the caller's working
 directory. For example, `python3 scan.py ./repository --no-osv --json report.json`
 writes `./report.json`, not `./repository/report.json`. Absolute output paths
@@ -419,12 +426,39 @@ processed manifests, but does not map each package to all its occurrences.
 file count once. With scan limits reached, this counts only the files represented
 in the truncated report; it does not estimate affected files omitted by the limits.
 
+`summary.files_with_findings_by_path_context` splits those distinct retained
+file counts into `scaffold` and `other`, including zero counts. It uses the same
+path-component heuristic as `summary.findings_by_path_context` (for example,
+`tests/`, `examples/`, and `docs/`); filename-only hints such as `src/test_app.py`
+do not make a path scaffold here. Repeated findings, categories, severities, and
+line numbers in one file count once; findings with no line number still count.
+The two buckets sum to `summary.files_with_findings`. This describes retained
+finding paths, not all affected manifests or a judgment that a file is safe.
+Counts remain available with `--summary-only`, with or without `--triage`.
+
 `summary.findings_by_file` maps relative file paths to emitted finding counts,
 with paths sorted lexically. It includes all categories and severities, omits
 files with no findings, and is `{}` for an empty report. Counts sum to the length
 of `findings`; a dependency finding with multiple advisories counts once. Scan
 limits restrict these counts to retained findings, and the mapping does not
 change with `--triage` or affect `manifest_hash`.
+
+`summary.files_with_multiple_findings` counts relative file paths with at least
+two emitted findings across all categories and severities. Findings on the same
+line, and findings without a line number, each contribute to that file's count.
+Each qualifying file counts once; an empty report yields zero. Scan limits
+restrict this count to retained findings. It remains available with
+`--summary-only`; triage does not filter it.
+
+`summary.finding_lines_by_category` counts distinct retained `(file, line)`
+locations separately for `dependency-vuln`, `secret`, and `config`, including zero
+counts for categories without located findings. Findings with `line: null` are
+excluded. Multiple findings in one category at the same location count once;
+the same line number in different files counts separately. A location shared by
+categories counts in each, so the category counts can sum to more than
+`summary.finding_lines`. These are review-location counts after finding caps,
+not source-line coverage or evidence that a category is safe. The counts remain
+available with `--summary-only`, with or without `--triage`.
 
 `summary.findings_without_line` counts emitted findings whose `line` is `null`,
 such as dependency findings and the missing Dockerfile USER warning. It counts
@@ -441,6 +475,13 @@ Dockerfile USER check, are excluded. Empty or entirely unlocated reports yield
 zero. This counts retained finding locations after limits, not lines scanned,
 all affected files, or source coverage. Triage does not filter the count;
 findings, severity gates and `manifest_hash` are unchanged.
+
+`summary.finding_lines_by_severity` counts distinct retained `(file, line)`
+locations separately for `critical`, `high`, `medium`, `low`, and `unknown`,
+including zero counts. Findings without a line number are excluded. Multiple
+findings at the same location and severity count once; the same location at two
+severities counts in both buckets, so their sum can exceed `finding_lines`.
+These are raw finding severities; triage does not filter or reclassify the counts.
 
 `summary.finding_lines_by_file` breaks that count down by relative file path,
 with paths sorted lexically. Each value counts distinct retained non-null line
@@ -647,6 +688,14 @@ It uses the existing case-insensitive path-segment heuristic used by
 sum to `summary.total_findings`. Only findings retained after scan limits count.
 This path label does not establish whether a file is deployed or a finding is
 harmless, and it does not change raw severity, triage, or the severity gate.
+
+`summary.finding_lines_by_path_context` counts distinct retained `(file, line)`
+locations in the same `scaffold` and `other` path groups, including zero counts.
+Findings without a line number are excluded. Multiple findings at one location
+count once even across categories and severities; equal line numbers in different
+files count separately. The two counts sum to `summary.finding_lines`. These are
+review locations after scan limits, not source coverage or proof that scaffold
+findings are harmless. Triage does not filter the counts.
 
 `summary.config_lines` counts distinct `(file, line)` locations in emitted
 configuration findings with a line number. Multiple rules on one line count once;
@@ -1052,6 +1101,20 @@ Regex scan of text files ≤ 1 MiB. Binary files (null byte), `.git/`,
 binary/image extensions are skipped. Evidence is always redacted to the first 4
 characters plus `…`.
 
+Secret checks operate on text, without parsing the source language or Markdown.
+A matching token or generic assignment inside a comment, string literal, or
+Markdown code block can therefore produce a finding at that source line;
+comment markers and code fences do not exempt it. Existing file/line limits,
+pattern rules, and value-shape hints still apply. `--triage` uses its path and
+value heuristics, not comment or code-block syntax, to classify these findings;
+the raw severity gate still includes them.
+
+A leading dot does not by itself exclude a file or directory. For example,
+`.settings` can receive secret checks, and files under `.config/` can receive
+secret, config and supported dependency checks. Named directory exclusions
+such as `.git/` and `.venv/`, file-type exclusions, and the usual scan limits
+still apply; hidden paths are not a separate coverage category.
+
 The generic-assignment check skips values starting with `http://`, `https://`,
 `ws://` or `wss://` (case-insensitive). This excludes endpoint strings, not all
 secrets inside URLs: provider-token patterns still report with redacted evidence.
@@ -1205,6 +1268,14 @@ by the Dockerfile rules.
   empty values and public settings such as `PORT=8080` also count. It checks
   assignment presence, not whether the value is a secret. Such a file can have
   zero secret hits and still fail `--fail-on high`, including with `--triage`.
+  Assignment names must be unquoted ASCII identifiers: a letter or underscore,
+  followed by letters, digits or underscores. Leading whitespace and whitespace
+  before `=` are accepted; the optional `export` prefix must be lowercase and
+  followed by spaces or tabs. Quoted names, dotted or hyphenated names, names
+  starting with a digit, and non-ASCII names do not match this config rule;
+  a later matching assignment can still be reported. This is a line-based
+  presence check: it does not parse multiline quoted values, evaluate shell
+  commands or expand variables. Independent secret-pattern scanning still applies.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction —
   low, runtime user unverified (the base image may set `USER`; the scanner does not
   inspect images).
@@ -1300,8 +1371,17 @@ by the Dockerfile rules.
   `push`, and other triggers do not activate it. Absence of this finding does
   not establish read-only effective access.
 * `pull_request_target` workflows where an `actions/checkout` step's `with.ref`
-  uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
-  `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
+  uses `${{ github.event.pull_request.head.sha }}`,
+  `${{ github.event.pull_request.head.ref }}`, or `${{ github.head_ref }}` — high.
+  The checkout and ref must be in the same step; pinning the checkout action to a
+  full commit SHA does not suppress this separate check. Matching is literal and
+  case-sensitive, allows whitespace inside the expression braces, and also
+  matches a supported expression embedded in a longer ref string. The scanner
+  does not evaluate expressions: bracket notation such as
+  `${{ github['head_ref'] }}`, indirect references such as `${{ env.SELECTED_REF }}`,
+  and expressions containing operators such as `${{ github.head_ref || 'main' }}`
+  do not match these forms. No finding therefore does not establish that the
+  checkout ref is independent of PR input.
 * `.npmrc` containing an exact unscoped or registry-scoped `_authToken` key
   followed by `=`, or a `password` line — high. The token key must begin the line
   after optional whitespace; spaces or tabs before `=` are accepted. Token markers
