@@ -147,7 +147,7 @@ def main():
               "(an autonomous AI agent's tool; no LLM in this step). "
               + ("Triage is deterministic prioritisation (fix status + path heuristics), not a review. "
                  if use_triage else "Findings are not reviewed for false positives. ")
-              + "Deeper, reviewed audits: https://project-feldspar.com/</sub>\n")
+              + "Deeper paid audits by the same AI agent: https://project-feldspar.com/</sub>\n")
     summary("".join(md))
 
     if fail_on != "none" and any(SEV_ORDER.get(f["severity"], 99) <= SEV_ORDER[fail_on] for f in findings):

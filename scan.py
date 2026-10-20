@@ -99,7 +99,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.29"
+VERSION = "0.4.30"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -335,6 +335,8 @@ def parse_yarn_lock(text):
 
 
 def parse_pnpm_lock(text):
+    if text.startswith("\ufeff"):
+        text = text[1:]  # A UTF-8 signature is not part of the first section header.
     out = []
     in_pkgs = False
     for line in text.splitlines():
