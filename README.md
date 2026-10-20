@@ -41,6 +41,13 @@ The equivalent inline form `--json=PATH` accepts a non-empty path, including
 `--json="report folder/result=a.json"`; equals signs within the path are preserved.
 An empty `--json=` is an argument error (exit 2) before scanning or cloning.
 
+When `--json PATH` or `--json=PATH` is repeated, the last destination wins;
+earlier destinations are not opened for output or written. For example,
+`--json unused.json --json=-` prints only to stdout, while
+`--json=- --json final.json` writes only `final.json`. This also lets a wrapper's
+output destination be overridden. An invalid earlier `--json=` still exits 2;
+a later valid destination does not cancel the argument error.
+
 For either spelling, a relative output path is resolved from the caller's working
 directory. For example, `python3 scan.py ./repository --no-osv --json report.json`
 writes `./report.json`, not `./repository/report.json`. Absolute output paths
@@ -51,9 +58,10 @@ checks. Save reports outside the target to avoid scanning earlier output.
 
 Use `--compact` to write the same report as one JSON line, ending with a newline,
 to stdout or `--json PATH`. Use `--pretty` to explicitly select the default
-two-space indented JSON. Use `--indent N` to select zero through eight spaces per
+two-space indented JSON. Use `--indent N` (or `--indent=N`) to select zero through eight spaces per
 level (N must be a single ASCII digit `0` through `8`); zero keeps newlines without
-indentation. The last `--compact`, `--pretty`, or `--indent N` flag wins. Invalid or
+indentation. Use `--tab-indent` for one tab per JSON nesting level. The last
+`--compact`, `--pretty`, `--indent N`, or `--tab-indent` flag wins. Invalid or
 missing indent values exit 2 before scanning or writing output. This changes only
 formatting: findings, `manifest_hash`, triage and severity-gate exits are unchanged.
 
@@ -72,11 +80,15 @@ output and changes only serialization; the default still escapes non-ASCII
 characters. Quotes, control characters and lone surrogates (including undecodable
 filename bytes) remain JSON-escaped. Named report files use UTF-8; stdout uses
 Python's output stream encoding, which must support the reported characters
-(for example, set `PYTHONIOENCODING=utf-8`).
+(for example, set `PYTHONIOENCODING=utf-8`). Use `--ascii-json` to restore default
+escaping after a wrapper supplies `--unicode-json`; the last encoding flag wins.
+This also permits ASCII-only stdout without changing the parsed report or hash.
 
 Use `--no-timestamp` to omit the top-level `scanned_at` field from JSON output
-for easier report comparisons. The timestamp remains present by default. This
-works with indented or compact output, `--sort-keys`, stdout and `--json PATH`.
+for easier report comparisons. Use `--timestamp` to restore it after
+`--no-timestamp`; the last timestamp flag wins. The timestamp remains present
+by default. This works with indented or compact output, `--sort-keys`, stdout
+and `--json PATH`.
 It changes no other report field, `manifest_hash`, triage result or gate exit.
 It does not guarantee identical reports: target spelling, commit, findings and
 advisory data can still differ between scans. Repeating the flag is harmless.
@@ -85,6 +97,8 @@ Use `--quiet` to suppress the `wrote PATH (N findings)` confirmation on stderr
 when saving JSON with `--json PATH` or `--json=PATH`. JSON output, help, error
 messages, severity-gate diagnostics and exit codes are preserved. With stdout
 output (including `--json -`), this flag has no effect on the report.
+Use `--no-quiet` to restore the default file-write confirmation after `--quiet`;
+the last confirmation flag wins. Neither flag changes JSON output or diagnostics.
 
 Run `python3 scan.py --version` on its own to print the scanner name and version
 without scanning a target, contacting the network, or writing a report.
@@ -99,7 +113,7 @@ standalone `--version` prints the version, even when a directory has that name.
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: project-feldspar-resources/feldspar-scan@v0.4.22
+- uses: project-feldspar-resources/feldspar-scan@v0.4.28
   with:
     fail-on: high          # none | low | medium | high | critical
     output: feldspar-scan.json
@@ -117,7 +131,7 @@ Inputs: `path` (default `.`), `fail-on` (default `none`), `output`, `osv`
 and a findings table with a per-finding triage column; `triage: "false"` gives the
 plain table. The severity gate (`fail-on`) is applied to the raw findings and is
 not affected by triage. Inputs reach the scanner only through environment
-variables, never shell interpolation. Pin to a release tag (`@v0.4.22`) or a commit
+variables, never shell interpolation. Pin to a release tag (`@v0.4.28`) or a commit
 SHA if you need reproducibility; `@main` tracks development.
 
 [![self-test](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml/badge.svg)](https://github.com/project-feldspar-resources/feldspar-scan/actions/workflows/selftest.yml)
@@ -170,6 +184,11 @@ An exit code of `0` means no severity gate fired; it
 does not certify a complete assessment. Review `errors`, `summary.notes`,
 `summary.lockfiles_parsed`, and `summary.packages_found` in the report.
 `--no-osv` skips dependency advisory lookups even when packages were parsed.
+Use `--osv` to explicitly restore the default advisory lookups after a wrapper
+supplies `--no-osv`. The last `--osv` or `--no-osv` flag wins. Enabling lookups
+can contact OSV.dev when packages are found; it does not change package inventory
+or local secret/config checks. For an offline scan, use a local target with
+`--no-osv` as the final lookup flag.
 
 ## Self-test
 
@@ -191,8 +210,19 @@ commit, so it differs from a report containing a resolved commit even when
 findings and target are identical. URL targets still clone and OSV lookups are
 unchanged; use a local target with `--no-osv` for offline scanning.
 
+Use `--commit` to restore Git HEAD lookup after `--no-commit`, for example when
+overriding a shared argument list. The last commit flag wins. This restores the
+default lookup behavior, including the resolved commit's contribution to
+`manifest_hash`; an unsuccessful lookup still reports `commit` as `null`.
+
 Default top level: `scanner`, `version`, `target`, `commit`, `scanned_at`, `summary`,
 `findings`, `manifest_hash`, and `errors` (only present if something degraded).
+
+Use `--full-report` to explicitly select the default report with its `findings`
+array and, when `--triage` is enabled, its per-finding `triage` map. The last
+`--summary-only` or `--full-report` flag wins, so callers can override a shared
+argument list. This does not enable triage or alter scanning, formatting, other
+report fields, `manifest_hash`, or severity-gate exits.
 
 Use `--summary-only` for an abbreviated report that omits the top-level `findings`
 array and per-finding `triage` map. All other fields remain, including
@@ -221,7 +251,7 @@ truncation flags and OSV mode as well. Error reporting does not change findings,
 symlink exclusions, up to the file limit. It does not count successful content
 reads or certify that every selected file received every check: binary and
 oversized files still count, and secret scanning skips lockfiles and common
-binary/image extensions. Excluded directories and symlinks do not count. When
+binary/image extensions. Excluded child directories and symlink entries do not count. When
 `summary.truncated.files` is true, additional candidate files were omitted.
 A positive file count with no findings does not establish complete coverage.
 
@@ -245,6 +275,22 @@ encountered before traversal stops, including the extra candidate used to detect
 the file limit; it is not a total of all omitted files. Zero does not establish
 complete coverage. Skips alone do not trip the severity gate.
 
+`summary.secret_hits_by_file` maps relative paths to counts of retained secret
+findings, in sorted path order. Repeated hits on the same line count separately;
+config and dependency findings do not contribute. Only paths with secret findings
+appear, and no retained secrets produces `{}`. Counts sum to `summary.secret_hits`,
+include low-severity hints, and can be reduced by finding caps. They do not prove
+that credentials are real or that scanning was complete. This summary does not
+change findings, gates, triage, or `manifest_hash`.
+
+These symlink exclusions apply to entries encountered **beneath** the selected
+target. An explicitly supplied local target that is a symlink to a directory is
+followed: its regular descendants are scanned and counted normally, while links
+encountered inside it are still skipped. The target alias itself does not add to
+`summary.skipped_non_regular` or `summary.files_scanned`. The report retains the
+supplied target spelling, and finding paths are relative to that target; it does
+not replace the reported target with the resolved directory path.
+
 `summary.osv_enabled` is `false` when `--no-osv` disables dependency advisory
 lookups, and `true` otherwise. It records the selected mode, not lookup success:
 check `errors`, `summary.packages_found`, and `summary.lockfiles_parsed` for
@@ -257,6 +303,28 @@ entries for each observed ecosystem, in sorted ecosystem order. Its counts sum t
 different versions count separately. Empty inventory produces `{}`. These are
 inventory counts, including with `--no-osv`, not advisory counts or proof of a
 complete assessment. File limits bound this inventory; finding limits do not.
+
+`summary.multi_version_packages` maps ecosystems to package names to lists of
+versions, including only names with multiple distinct versions in that ecosystem's
+parsed inventory. For example, `{"PyPI": {"demo": ["1.0", "2.0"]}}` means both
+versions were found; duplicates across manifests count once. Ecosystems, names,
+and version strings are ordered lexicographically, not by semantic version.
+Names and versions use the existing parsers' normalization; ecosystems remain
+separate. No multi-version names produces `{}`. This works with `--no-osv` and is
+unaffected by finding caps, but file limits and parser coverage bound the inventory.
+Multiple versions can be intentional and do not establish a vulnerability or a
+resolution conflict. This field adds no findings and does not affect severity gates
+or `manifest_hash`.
+
+`summary.package_names_by_ecosystem` counts distinct parsed package names in each
+ecosystem, ignoring repeated versions and manifests. Names use the existing
+parsers' spelling and normalization; scoped npm names remain distinct from
+unscoped names. Keys are alphabetically ordered, and an empty inventory yields
+`{}`. Unlike `summary.packages_by_ecosystem` (package/version pairs), multiple
+versions of one name count once here. Counts remain available with `--no-osv`
+and are independent of finding limits, but file limits and parser scope still
+apply. They do not establish complete dependency coverage or vulnerability
+status, and do not affect `manifest_hash`.
 
 `summary.vulnerable_packages_by_ecosystem` counts unique vulnerable
 `(ecosystem, name, version)` entries returned by OSV, grouped in sorted ecosystem
@@ -303,8 +371,39 @@ with the same commit and OSV data. Edits that leave findings unchanged do not
 change it when target and commit are unchanged. `target` preserves the literal
 CLI argument: different spellings of the same path can produce different hashes.
 
+To recompute it from a full JSON report, use Python's ASCII-escaped JSON strings
+(`ensure_ascii=True`), sorted object keys, and compact separators, then hash the
+UTF-8 bytes without a trailing newline. Array order is preserved. Non-ASCII
+characters stay escaped in this hash input even with `--unicode-json`; report
+indentation and key-order flags do not change it. For example, with a full report
+saved as `report.json`:
+
+```python
+import hashlib
+import json
+
+with open("report.json", encoding="utf-8") as report_file:
+    report = json.load(report_file)
+payload = {key: report[key] for key in ("findings", "target", "commit")}
+canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=True)
+assert hashlib.sha256(canonical.encode("utf-8")).hexdigest() == report["manifest_hash"]
+```
+
+This recipe requires the full `findings` array; `--summary-only` output omits it.
+
 Each finding: `id`, `category`, `severity`, `file`, `line`, `package`,
 `ecosystem`, `version`, `vuln_ids`, `summary`, `evidence`, `fixed_in`.
+For dependency findings, `evidence` displays only the first five advisory IDs in
+lookup-result order, while `vuln_ids` retains the full list sorted by ID. The
+finding `summary` includes the advisory count and only the first advisory's
+summary, limited to 120 characters. These display fields are not a complete
+advisory list or a description of the most severe advisory. Advisories omitted
+from `evidence` still contribute to severity, fix metadata, advisory counts,
+triage and severity gates. Use `vuln_ids` to review all reported advisories for
+an emitted finding; file/finding limits and lookup failures can still limit
+report coverage.
+
 Findings are sorted by severity (critical, high, medium, low, unknown), then
 category, file, line, package and summary. Missing lines sort as zero; missing
 file/package values sort as empty strings. `id` is assigned after sorting
@@ -327,12 +426,46 @@ processed manifests, but does not map each package to all its occurrences.
 file count once. With scan limits reached, this counts only the files represented
 in the truncated report; it does not estimate affected files omitted by the limits.
 
+`summary.files_with_findings_by_path_context` splits those distinct retained
+file counts into `scaffold` and `other`, including zero counts. It uses the same
+path-component heuristic as `summary.findings_by_path_context` (for example,
+`tests/`, `examples/`, and `docs/`); filename-only hints such as `src/test_app.py`
+do not make a path scaffold here. Repeated findings, categories, severities, and
+line numbers in one file count once; findings with no line number still count.
+The two buckets sum to `summary.files_with_findings`. This describes retained
+finding paths, not all affected manifests or a judgment that a file is safe.
+Counts remain available with `--summary-only`, with or without `--triage`.
+
 `summary.findings_by_file` maps relative file paths to emitted finding counts,
 with paths sorted lexically. It includes all categories and severities, omits
 files with no findings, and is `{}` for an empty report. Counts sum to the length
 of `findings`; a dependency finding with multiple advisories counts once. Scan
 limits restrict these counts to retained findings, and the mapping does not
 change with `--triage` or affect `manifest_hash`.
+
+`summary.files_with_multiple_findings` counts relative file paths with at least
+two emitted findings across all categories and severities. Findings on the same
+line, and findings without a line number, each contribute to that file's count.
+Each qualifying file counts once; an empty report yields zero. Scan limits
+restrict this count to retained findings. It remains available with
+`--summary-only`; triage does not filter it.
+
+`summary.finding_lines_by_category` counts distinct retained `(file, line)`
+locations separately for `dependency-vuln`, `secret`, and `config`, including zero
+counts for categories without located findings. Findings with `line: null` are
+excluded. Multiple findings in one category at the same location count once;
+the same line number in different files counts separately. A location shared by
+categories counts in each, so the category counts can sum to more than
+`summary.finding_lines`. These are review-location counts after finding caps,
+not source-line coverage or evidence that a category is safe. The counts remain
+available with `--summary-only`, with or without `--triage`.
+
+`summary.findings_without_line` counts emitted findings whose `line` is `null`,
+such as dependency findings and the missing Dockerfile USER warning. It counts
+findings, not files or advisory IDs: two dependency findings in one manifest
+count twice. Empty reports and reports containing only located findings yield
+zero. Only findings retained after caps count; this field remains available with
+`--summary-only`. It does not change findings, triage, gates or `manifest_hash`.
 
 `summary.finding_lines` counts distinct `(file, line)` locations across all
 emitted findings with a non-null line number. Multiple rules or categories on
@@ -342,6 +475,19 @@ Dockerfile USER check, are excluded. Empty or entirely unlocated reports yield
 zero. This counts retained finding locations after limits, not lines scanned,
 all affected files, or source coverage. Triage does not filter the count;
 findings, severity gates and `manifest_hash` are unchanged.
+
+`summary.finding_lines_by_severity` counts distinct retained `(file, line)`
+locations separately for `critical`, `high`, `medium`, `low`, and `unknown`,
+including zero counts. Findings without a line number are excluded. Multiple
+findings at the same location and severity count once; the same location at two
+severities counts in both buckets, so their sum can exceed `finding_lines`.
+These are raw finding severities; triage does not filter or reclassify the counts.
+
+`summary.finding_lines_by_file` breaks that count down by relative file path,
+with paths sorted lexically. Each value counts distinct retained non-null line
+numbers across all rules and categories in that file. Paths with only unlocated
+findings are omitted; an empty or entirely unlocated report yields `{}`. Values
+sum to `summary.finding_lines`, including when `--summary-only` omits the findings.
 
 `summary.files_with_findings_by_category` counts distinct relative file paths for
 each of `dependency-vuln`, `secret`, and `config`, including zero counts. Repeated
@@ -375,6 +521,16 @@ this does not certify coverage (review OSV status, errors and truncation). Triag
 and severity gates do not filter these counts. This field does not affect
 `manifest_hash`.
 
+`summary.dependency_findings_by_manifest` counts emitted dependency findings per
+representative manifest path, with paths sorted lexicographically. Each finding
+counts once even when it lists multiple advisory IDs; other finding categories
+do not contribute. A package/version shared by multiple manifests is attributed
+only to its selected representative path, not every manifest containing it.
+Paths without retained dependency findings are omitted; an empty result is `{}`.
+The counts sum to `summary.by_category["dependency-vuln"]` and reflect finding
+limits. They do not certify advisory coverage; review OSV status, errors and
+truncation. Triage, severity gates and `manifest_hash` are unchanged.
+
 `summary.dependency_findings_with_fixes` counts emitted dependency findings with
 at least one reported `fixed_in` version. Each package/version finding counts
 once, even with multiple advisories or fixed versions. This counts reported fix
@@ -401,6 +557,13 @@ These labels are not stable rule IDs or credential validation; no matched values
 are included. Scan limits restrict the counts to emitted findings. This field
 does not affect `manifest_hash` or the severity gate.
 
+`summary.config_issues_by_file` counts emitted configuration findings by relative
+file path, with paths in alphabetical order. Multiple findings in one file count
+separately, including file-level findings without a line number. Paths with no
+configuration findings are omitted; no configuration findings produces `{}`.
+Counts sum to `summary.config_issues` and reflect only findings retained within
+scan limits, not complete configuration coverage.
+
 `summary.config_issues_by_rule` groups emitted configuration findings by their
 existing human-readable `summary` labels, in alphabetical order. These labels
 are not stable rule IDs. Counts sum to `summary.config_issues`; no configuration
@@ -426,6 +589,16 @@ Zero means no advisory IDs were emitted, including with `--no-osv`; it does not
 certify coverage or successful lookups. Check errors, notes and truncation flags.
 This summary field does not affect `manifest_hash`.
 
+`summary.unique_advisories_by_ecosystem` maps each ecosystem to its count of
+distinct advisory ID strings in retained dependency findings, with ecosystem
+keys sorted alphabetically. Repeated IDs across packages, versions and files
+count once within an ecosystem. An ID shared across ecosystems counts in each,
+so these counts can sum to more than `summary.unique_advisories`. Different IDs
+remain separate even if they are aliases. Ecosystems without emitted advisory
+IDs are omitted; no emitted IDs produces `{}`, including with `--no-osv`.
+File and finding limits bound these counts; they do not establish coverage or
+successful lookups. Findings, triage, gates and `manifest_hash` are unchanged.
+
 `summary.dependency_findings_by_advisory` maps each advisory ID to the number of
 emitted dependency findings referencing it, with keys sorted alphabetically.
 Repeated IDs within one finding count once; distinct package versions and
@@ -437,6 +610,17 @@ may reference several advisories. Counts include only findings retained after
 limits, and no emitted dependency findings produces `{}`, including with
 `--no-osv`. This is not a coverage guarantee. Findings, gates, triage and
 `manifest_hash` are unchanged by this summary.
+
+`summary.dependency_files_by_advisory` maps each advisory ID to the number of
+distinct representative manifest paths in its emitted dependency findings, with
+keys sorted alphabetically. Several packages or versions sharing an advisory in
+one file count once; the same advisory in two representative paths counts twice.
+Package deduplication selects one representative path per ecosystem/name/version,
+so this is not a count of every manifest containing an affected package.
+Different advisory IDs remain separate even when they are aliases. Counts use
+only findings retained after limits; no emitted dependency findings produces
+`{}`, including with `--no-osv`. Zero is not a coverage guarantee. This field
+does not change findings, gates, triage or `manifest_hash`.
 
 `--fail-on SEV` and `--fail-on=SEV` accept case-insensitive values. When repeated,
 the last value wins across both spellings: `--fail-on HIGH --fail-on=none`
@@ -505,6 +689,14 @@ sum to `summary.total_findings`. Only findings retained after scan limits count.
 This path label does not establish whether a file is deployed or a finding is
 harmless, and it does not change raw severity, triage, or the severity gate.
 
+`summary.finding_lines_by_path_context` counts distinct retained `(file, line)`
+locations in the same `scaffold` and `other` path groups, including zero counts.
+Findings without a line number are excluded. Multiple findings at one location
+count once even across categories and severities; equal line numbers in different
+files count separately. The two counts sum to `summary.finding_lines`. These are
+review locations after scan limits, not source coverage or proof that scaffold
+findings are harmless. Triage does not filter the counts.
+
 `summary.config_lines` counts distinct `(file, line)` locations in emitted
 configuration findings with a line number. Multiple rules on one line count once;
 the same line number in different files counts separately. File-wide findings
@@ -529,6 +721,27 @@ findings count, so scan limits may omit affected files. No config findings yield
 severities, are unchanged by `--triage`, and do not affect `manifest_hash` or gates.
 
 ### Triage (`--triage`)
+
+`triage_summary.dependency_actions_by_ecosystem` maps each ecosystem with retained
+dependency findings to `upgrade` and `monitor` finding counts (both keys are
+present, including zeros). Ecosystem keys are alphabetically ordered; no retained
+dependency findings yields `{}`. Missing ecosystem metadata uses `unknown`.
+Each finding counts once, regardless of advisory IDs or fixed versions; scaffold
+findings are included. These opt-in counts follow existing fix-metadata actions:
+non-empty `fixed_in` selects `upgrade`, otherwise `monitor`. They do not establish
+release availability, unique-package counts, or complete advisory coverage, and
+reflect finding limits. Findings, existing triage decisions, gates and
+`manifest_hash` are unchanged.
+
+`triage_summary.dependency_actions_by_file` maps relative representative manifest
+paths to `upgrade` and `monitor` finding counts, with both buckets present for
+each path. Paths are sorted; the map is `{}` without retained dependency
+findings. A finding counts once regardless of advisory IDs or fixed versions:
+non-empty `fixed_in` selects `upgrade`, otherwise `monitor`. These are existing
+fix-metadata classifications, not confirmation of release availability. Scaffold
+paths are included. A package found in several manifests is attributed only to
+the scanner's representative path, and scan limits can truncate these counts.
+This opt-in summary leaves findings, triage actions, hashes and gates unchanged.
 
 `triage_summary.dependency_actions_by_severity` groups emitted dependency findings
 into `upgrade` and `monitor` rows, each with raw-severity counts (`critical`,
@@ -608,6 +821,15 @@ review, and covers only retained findings when scan limits truncate results.
 The existing `triage_summary.config.needs_review` remains a finding count.
 This additional count does not change findings, triage actions, the hash or gate.
 
+With `--triage`, `triage_summary.config_review_by_file` maps relative file paths
+to the number of retained configuration findings needing review in each file.
+Keys are sorted alphabetically. Multiple findings in one file count separately;
+test/example/fixture paths remain included. Secret and dependency findings and
+findings without a non-empty file path do not contribute. The mapping is empty
+when no configuration findings have paths. It covers only retained findings when
+limits truncate results, and remains available with `--summary-only`. This field
+does not change findings, triage actions, the hash or severity gate.
+
 With `--triage`, `triage_summary.dependency_files_needing_upgrade` counts distinct
 representative manifest paths in emitted dependency findings with an `upgrade`
 action. Multiple packages or advisories in one file count once; scaffold paths
@@ -624,6 +846,16 @@ count once; likely-false-positive secrets and non-secret findings do not count.
 It is zero when no secret findings need review. With scan limits reached, it
 counts only files represented in the emitted findings, not omitted files. Like
 the rest of triage, this count does not change findings, the hash, or the gate.
+
+`triage_summary.secret_review_by_file` maps relative paths to the number of
+emitted secret findings classified as `review`, with paths sorted alphabetically.
+Repeated hits in a file count separately; informational secrets and non-secret
+findings are excluded. The values sum to `triage_summary.secrets.needs_review`,
+and the number of paths equals `triage_summary.secret_files_needing_review`.
+No secrets needing review produces `{}`. This field is present only with
+`--triage`; finding limits can make the counts partial. The classifications are
+heuristics, not confirmation that credentials are live. The field adds no raw
+values and does not change findings, the hash, or the severity gate.
 
 With `--triage`, `triage_summary.dependency_outside_scaffold_lockfiles`
 contains `upgradeable` and `monitor_only` counts for emitted dependency findings
@@ -642,6 +874,15 @@ to `triage_summary.secrets.likely_false_positive`. These are heuristic reasons,
 not confirmed false positives; review them before dismissing a finding. When
 limits truncate findings, only emitted hits count. This opt-in summary does not
 change raw findings, `manifest_hash`, or the severity gate.
+
+`triage_summary.secret_false_positives_by_file` maps relative file paths to counts
+of emitted secret findings classified as likely false positives. Keys are sorted;
+the map is `{}` when none qualify. Multiple findings on one line count separately,
+and a file may contain both informational and review-needed secrets; only the
+informational secrets count here. Counts sum to
+`triage_summary.secrets.likely_false_positive` and include only retained findings
+when scan limits apply. This is a heuristic triage aid, not confirmation that a
+file is safe; raw findings and severity gates remain unchanged.
 
 `summary.secret_files_by_rule` maps secret finding summary labels to distinct
 affected-file counts, in alphabetical label order. Repeated hits for one label
@@ -680,6 +921,92 @@ Manifests/lockfiles parsed (files under `node_modules/`, `vendor/`, `.git/`,
 | `go.sum` | Go | only when no `go.mod` sits beside it (go.sum also lists superseded versions); `/go.mod` suffix stripped |
 | `Gemfile.lock` | RubyGems | `specs:` within `GEM` sections only, `    name (1.2.3)`; `GIT`/`PATH` specs excluded |
 
+Requirements files are discovered by case-sensitive basename: any name starting
+with `requirements` and ending with `.txt`, at any included directory depth.
+For example, `requirements-dev.txt` and `nested/requirements_extra.txt` qualify;
+`Requirements.txt`, `requirements.in`, `constraints.txt`, and `base.txt` do not.
+Pip include and constraint directives (`-r`/`--requirement`, `-c`/`--constraint`)
+are ignored, not followed. Referencing `base.txt` therefore does not inventory
+its pins. A matching `requirements*.txt` file is discovered independently even
+when no directive references it, subject to the usual directory and file limits.
+A directive-only `requirements.txt` can appear in `summary.lockfiles_parsed`
+with zero packages; that does not assess the dependencies in its include targets.
+
+For `poetry.lock`, `uv.lock`, and `Cargo.lock`, the TOML reader uses package
+name/version pairs without inspecting source metadata. Git, local/editable, and
+source-less entries with a supported name/version pair can therefore enter the
+inventory and advisory lookup as PyPI or crates.io packages, according to the
+filename. Source URLs and revisions are not sent in those queries; entries with
+the same ecosystem, name, and version collapse into one identity even when their
+sources differ. A registry advisory match does not establish that a fork or local
+package contains the affected code. Check the source before acting on that match.
+`--no-osv` retains this inventory but skips advisory lookup.
+
+For `package-lock.json`, package inventory does not filter on `dev`, `optional`,
+`devOptional`, `os`, or `cpu` metadata. Entries with these fields can enter npm
+advisory lookup from both the `packages` map and the fallback `dependencies` tree,
+including nested dependencies of development-only packages. This is a static
+lockfile inventory, not the packages installed by `npm ci --omit=dev` or on the
+current operating system and CPU. `--no-osv` keeps this inventory but skips
+advisory queries; a finding does not establish production installation or reachability.
+
+For `pnpm-lock.yaml`, inventory comes from recognized keys in `packages:`, without
+resolving the dependency graph in `importers:` or `snapshots:`. A recognized package
+can enter npm advisory lookup even when no importer references it or its metadata
+marks it development-only, optional, or specific to another OS/CPU. Entries found
+only in importers or snapshots do not supply inventory. Parenthesized peer-context
+suffixes are removed from package keys; entries with the same name and version
+then count once, rather than once per peer context. `--no-osv` preserves this
+inventory but skips advisory queries. These counts do not establish which packages
+are installed or reachable; a parsed lockfile can still yield zero packages.
+
+Dependency discovery matches these basenames exactly and case-sensitively at
+any scanned directory depth; `requirements*.txt` is the prefix/suffix exception.
+For example, `Package-lock.json`, `package-lock.json.bak`, and `Requirements.txt`
+do not supply inventory. Neither do `package.json`, `npm-shrinkwrap.json`,
+`Pipfile.lock`, `pyproject.toml`, or `composer.lock`: their dependency declarations
+are not parsed or sent for advisory lookup. Such files may still receive local
+secret/config checks. A tree containing only unrecognized manifest filenames has
+zero inventoried packages, an empty `summary.lockfiles_parsed`, and a note that no
+supported dependency manifest was parsed; this does not assess those dependencies.
+
+For `package-lock.json`, package names in the `packages` map come from the path
+after its last `node_modules/` component, including scoped names. An entry's
+`name` metadata does not override that installed name. In the legacy
+`dependencies` tree, the dependency key supplies the name and the `version`
+string is kept literally. The scanner does not resolve npm aliases: an alias
+can therefore be queried under its installed name rather than the underlying
+package name, and a legacy `npm:...` version is not decoded. These same identities
+are retained in offline inventory with `--no-osv`. A report without dependency
+findings does not establish advisory coverage for the underlying aliased package.
+
+For `package-lock.json`, the legacy `dependencies` tree is used only when the
+`packages` map yields no package entries. An absent or empty map, a root-only
+map, or a map whose entries lack usable versions can therefore fall back to
+the legacy tree, including nested dependencies. Once the map yields even one
+package, the two sections are not merged: legacy-only packages and alternate
+legacy versions do not enter inventory or advisory queries. A partially
+recognized map can therefore leave legacy entries unassessed. This selection
+also applies to package inventory with `--no-osv`.
+
+Go manifest selection is directory-local: a `go.mod` in the selected scan file
+list suppresses only the `go.sum` beside it, not one in a child or sibling
+directory. Selection happens before parsing. An empty `go.mod`, one with no
+recognized requirements, or one that cannot be read still suppresses its
+neighboring `go.sum`; the scanner does not use `go.sum` as a parse-failure
+fallback. Conversely, a `go.mod` absent from the selected file list does not
+suppress `go.sum` merely because it exists on disk. Review
+`summary.lockfiles_parsed` and `summary.packages_found`: zero packages in these
+cases does not mean the checksum-listed dependencies were assessed.
+
+For `package-lock.json`, inventory is not filtered to production dependencies or
+to packages installed on the current machine. Both the v2/v3 `packages` map and
+the v1 `dependencies` tree include recognized name/version entries regardless of
+`dev`, `optional`, `devOptional`, `os`, or `cpu` metadata, including nested entries.
+These entries count in package summaries and are eligible for advisory lookup;
+`--no-osv` keeps the inventory but skips that lookup. A reported package therefore
+does not establish that it is installed or used in the deployed application.
+
 For `Gemfile.lock`, only gems listed in `GEM` sections enter the package inventory
 and RubyGems advisory lookup. Gems listed under `GIT` or `PATH` are excluded,
 even if their names and versions resemble registry gems. A lockfile containing
@@ -687,15 +1014,62 @@ only those excluded sources can still appear in `summary.lockfiles_parsed`
 while contributing zero packages and causing no advisory requests. A clean
 report therefore does not assess the excluded Git or local-path dependencies.
 
+For `yarn.lock`, descriptors using `workspace:`, `patch:`, `portal:`, `link:`,
+`file:`, `exec:`, `git:`, `github:`, `http:` or `https:` are excluded from package
+inventory and advisory queries, even when their entries contain numeric versions.
+This filter applies to each descriptor in a comma-separated list; a recognized
+registry descriptor in the same list can still contribute a package. Ordinary
+v1 ranges and Berry `npm:` descriptors remain supported. A lockfile containing
+only excluded descriptors can appear in `summary.lockfiles_parsed` with zero
+packages and no advisory requests. Such a report does not assess the excluded
+dependencies, including the registry packages underlying `patch:` descriptors.
+
+`Gemfile.lock` versions are kept literally, including platform suffixes such as
+`1.2.3-x86_64-linux`; the scanner does not normalize them to `1.2.3` for advisory
+lookup. The `PLATFORMS` section does not filter the inventoried `GEM` specs, so
+`synthetic-native (1.2.3)` and `synthetic-native (1.2.3-x86_64-linux)` count as two
+package/version entries and are queried separately. `PLATFORMS`, `DEPENDENCIES`
+and `BUNDLED WITH` metadata alone supply no package versions. This is lockfile
+inventory, not resolution of the gems installed on a particular host; an empty
+advisory response does not establish coverage for a platform-suffixed version.
+
+When `go.sum` is used, module-content rows and `/go.mod` rows for the same
+module/version contribute one inventory entry; a `/go.mod` row alone also
+contributes an entry. Distinct versions of one module remain separate entries
+and advisory queries, including superseded versions. The scanner checks for a
+nonempty `h1:` checksum field but does not validate its encoding or verify its
+digest against module contents. This inventory is neither an installed-module
+list nor a checksum-integrity assessment; a passing gate establishes neither.
+
 Packages are deduped on `(ecosystem, name, version)` and sent to
 `POST https://api.osv.dev/v1/querybatch` in chunks of 500. Each returned vuln id
 is then fetched from `GET https://api.osv.dev/v1/vulns/{id}` (cached in-memory
 per run) for severity and fixed versions.
 
-Severity: `database_specific.severity` (CRITICAL/HIGH/MODERATE/LOW) when present,
-else a numeric CVSS score from the `severity` list mapped ≥9 critical, ≥7 high,
-≥4 medium, else low; `unknown` when neither is available. A package finding takes
+Severity: a recognized `database_specific.severity` value
+(CRITICAL/HIGH/MODERATE/MEDIUM/LOW, case-insensitive) takes precedence over
+numeric scores. Otherwise the first supported numeric score in the `severity`
+list is used, mapped ≥9 critical, ≥7 high, ≥4 medium, else low; unsupported
+entries are skipped, and `unknown` is used when neither source is available.
+Within one advisory this is list order, not the highest numeric score: scores
+`4.0` followed by `9.8` produce medium, while reversing them produces critical.
+Consequently `--fail-on high` does not fire for the first ordering alone.
+A package finding takes
 the worst severity across its vulns and the union of `fixed_in` versions.
+
+Fix metadata has additional limits: for each advisory, the scanner collects
+nonempty `fixed` event values from every `affected` entry and range, without
+filtering by the queried package, ecosystem, range type, or installed version.
+It ignores `introduced`, `last_affected`, and `limit` event values. It removes
+duplicates, sorts the remaining strings lexicographically (so `10.0` precedes
+`2.0`), and retains only the first ten values per advisory. A package finding's
+`fixed_in` is the sorted, deduplicated union of those capped lists; that union
+can exceed ten values. With `--triage`, `upgrade_to` repeats this union.
+These values are advisory metadata, not a package-specific upgrade plan: they
+can include unrelated package versions or Git revisions, are not sorted by
+semantic version, and do not establish that a listed value fixes every advisory
+for the installed package. Check the original advisory and applicable release
+before choosing an upgrade.
 
 CVSS vector strings are not evaluated. An advisory with only vector strings and
 no recognized `database_specific.severity` remains `unknown`. Packages with such
@@ -703,8 +1077,22 @@ advisories can still produce dependency findings, subject to finding limits;
 other rated advisories can raise a package finding's severity. `unknown` findings do not trigger `--fail-on`,
 even at `low`. A passing severity gate therefore does not clear unrated advisories.
 
-HTTP timeout is 20 s per call. Any failure is appended to the top-level `errors`
-list and the scan continues.
+HTTP timeout is 20 s per call. Request failures are appended to the top-level
+`errors` list and the scan continues. If a batch request fails, that chunk yields
+no dependency findings, while later chunks are still queried. Parsed packages
+remain in the inventory; an empty findings array does not establish that their
+advisories were checked successfully.
+
+If an advisory-detail request fails after a batch returned its ID, the scanner
+keeps that ID and uses fallback details: `unknown` severity, no fixed versions,
+and the ID as the advisory summary. This fallback is cached for the rest of the
+scan, so a shared failed advisory is fetched and recorded as an error only once.
+Subject to finding limits, affected packages still produce dependency findings.
+Other successfully loaded advisories for the same package can supply a higher
+severity and fixed versions. With only failed details, `--triage` assigns
+`monitor`, and even `--fail-on low` does not fire for the resulting `unknown`
+findings. Request errors alone do not trip the severity gate; inspect `errors`
+alongside findings and inventory before interpreting a passing exit code.
 
 ### 2. `secret`
 
@@ -712,6 +1100,20 @@ Regex scan of text files ≤ 1 MiB. Binary files (null byte), `.git/`,
 `node_modules/`, `vendor/`, `dist/`, `build/`, lockfiles, `*.min.js`, and common
 binary/image extensions are skipped. Evidence is always redacted to the first 4
 characters plus `…`.
+
+Secret checks operate on text, without parsing the source language or Markdown.
+A matching token or generic assignment inside a comment, string literal, or
+Markdown code block can therefore produce a finding at that source line;
+comment markers and code fences do not exempt it. Existing file/line limits,
+pattern rules, and value-shape hints still apply. `--triage` uses its path and
+value heuristics, not comment or code-block syntax, to classify these findings;
+the raw severity gate still includes them.
+
+A leading dot does not by itself exclude a file or directory. For example,
+`.settings` can receive secret checks, and files under `.config/` can receive
+secret, config and supported dependency checks. Named directory exclusions
+such as `.git/` and `.venv/`, file-type exclusions, and the usual scan limits
+still apply; hidden paths are not a separate coverage category.
 
 The generic-assignment check skips values starting with `http://`, `https://`,
 `ws://` or `wss://` (case-insensitive). This excludes endpoint strings, not all
@@ -866,6 +1268,14 @@ by the Dockerfile rules.
   empty values and public settings such as `PORT=8080` also count. It checks
   assignment presence, not whether the value is a secret. Such a file can have
   zero secret hits and still fail `--fail-on high`, including with `--triage`.
+  Assignment names must be unquoted ASCII identifiers: a letter or underscore,
+  followed by letters, digits or underscores. Leading whitespace and whitespace
+  before `=` are accepted; the optional `export` prefix must be lowercase and
+  followed by spaces or tabs. Quoted names, dotted or hyphenated names, names
+  starting with a digit, and non-ASCII names do not match this config rule;
+  a later matching assignment can still be reported. This is a line-based
+  presence check: it does not parse multiline quoted values, evaluate shell
+  commands or expand variables. Independent secret-pattern scanning still applies.
 * `Dockerfile` (or `Dockerfile.*`) with no `USER` instruction —
   low, runtime user unverified (the base image may set `USER`; the scanner does not
   inspect images).
@@ -877,13 +1287,52 @@ by the Dockerfile rules.
 * `Dockerfile` base images with no tag or with `:latest` — low. Non-latest tagged images,
   full SHA-256 digest references, `scratch`, earlier stage aliases and image
   references containing `$` are excluded. A tag is not a guarantee of immutability.
+  Every `FROM` is checked, including unused build stages; leading `--name=value`
+  options such as `--platform=linux/amd64` are skipped. A registry port does not
+  count as a tag: `registry.example.invalid:5000/team/app` is flagged. The `latest`
+  tag comparison is case-sensitive (`:Latest` is excluded); `scratch` and earlier
+  stage aliases are compared case-insensitively. The digest exclusion recognizes
+  an `@sha256:` suffix with exactly 64 hexadecimal characters without verifying
+  image existence, digest integrity or trust. This is not a digest validator:
+  a non-latest tag can independently exclude a reference with a malformed digest.
+  Variables and stage dependencies are not resolved. Each matching instruction
+  produces one finding at its starting line, with the image reference omitted.
 * `Dockerfile` `ENV` / `ARG` assignments to secret-like variable names — high.
   Names such as `API_TOKEN` and `DB_PASSWORD` match; empty values, bare `ARG`
   declarations and whole-value `$VAR` / `${VAR}` references are excluded.
-  This is a name/value heuristic, not validation of a credential.
+  Names must use ASCII letters, digits and underscores, starting with a letter
+  or underscore. Matching is case-insensitive: `PASSWORD`, `PASSWD`, `SECRET`,
+  `TOKEN`, `API_KEY`, `PRIVATE_KEY`, `SECRET_KEY` or `SECRET_ACCESS_KEY` must be
+  the whole name or its suffix after an underscore. `MYTOKEN`, `TOKEN_FILE`,
+  `PASSWORD_HASH`, `APIKEY` and bare `KEY` do not match this config rule.
+  Both `ENV NAME=value` and legacy `ENV NAME value` forms are checked; multiple
+  `NAME=value` assignments in one instruction are checked independently.
+  After quote handling, only an empty value or a whole simple variable reference
+  is exempt: `${VAR:-demo}`, `${VAR}/suffix` and `prefix$VAR` remain findings.
+  Short values and placeholders such as `demo`, `changeme` and `xxxx` also remain
+  high-severity config findings; secret-pattern placeholder downgrades do not
+  apply to this rule. With `--triage` they still require `review` and can trip
+  `--fail-on high`, even with zero secret hits. Evidence omits the assigned value.
+  This is a name/value heuristic, not validation of a credential or evaluation
+  of Docker variable expansion; no finding does not establish a safe value.
+  Instructions in earlier stages also count; reported locations use the first
+  line of a continued instruction, and evidence omits the value. An excluded
+  assignment is not a guarantee that other scanner rules ignore its contents.
 * Shell-form `Dockerfile` `RUN` with `curl` directly piped to `sh` or `bash` —
   medium. JSON exec-form instructions and indirect shell execution are not
   analyzed. This flags the command shape without fetching or running anything.
+  Dockerfile configuration checks use a bounded logical-instruction heuristic,
+  not a full Dockerfile or shell parser. Backslash continuations (or backticks
+  with a recognized `# escape=` directive) join physical lines; findings for a
+  joined instruction point to its first physical line. Blank lines and full-line
+  comments are skipped, including inside a continuation. Recognized named
+  heredocs on `RUN`, `COPY`, and `ADD` skip their bodies and delimiter lines:
+  instruction-looking text in a body is not checked as Dockerfile configuration.
+  Simple unquoted or matching-quoted delimiter names are supported, including
+  tab-stripping `<<-` and multiple delimiters; general shell syntax is not parsed.
+  These exclusions apply only to configuration checks. The separate secret pass
+  still examines eligible comment and heredoc-body lines, so those lines can
+  produce secret findings and trip a severity gate.
 * `docker-compose*.yml` / `docker-compose*.yaml` / `compose.yml` / `compose.yaml` containing a plain
   `privileged: true` declaration — medium. The key may be unquoted or enclosed in
   matching single or double quotes; the value must remain plain `true`.
@@ -901,18 +1350,52 @@ by the Dockerfile rules.
 * `.github/workflows/*.y(a)ml` remote action or reusable workflow `uses:` refs
   that are not full 40-character hexadecimal commit SHAs — low. Includes
   `actions/*`; local `./` actions and `docker://` references are excluded.
+  All workflow config checks select only direct children of `.github/workflows`
+  relative to the scan target, with case-sensitive directory names and lowercase
+  `.yml` or `.yaml` extensions. Files in subdirectories of `workflows`, workflows
+  inside nested repositories, and files such as `build.YML` are not selected.
+  Scanning a nested repository as the target selects its own `.github/workflows`
+  children; scanning `.github/workflows` itself does not. Otherwise eligible
+  files outside this selection still receive independent secret-pattern scanning.
+  Absence of workflow config findings does not establish that a file was checked
+  by these rules.
 * Workflows triggered by `pull_request` with workflow/job `permissions:` declaring
   `write-all` or a scope set to `write` — medium. This flags requested permissions;
   job overrides, fork restrictions and repository policy can reduce actual access.
+  The check counts explicit declarations without resolving inheritance or job
+  overrides: workflow-level `write-all` is still reported when a job sets
+  `permissions: {}` or `read-all`. Separate block-map scopes set to `write` each
+  produce a finding; a simple inline permission map produces one finding even
+  with multiple write scopes. Missing declarations do not infer permission
+  defaults. This check requires `pull_request`; `pull_request_target` alone,
+  `push`, and other triggers do not activate it. Absence of this finding does
+  not establish read-only effective access.
 * `pull_request_target` workflows where an `actions/checkout` step's `with.ref`
-  uses `${{ github.event.pull_request.head.sha }}`, `head.ref`, or
-  `${{ github.head_ref }}` — high. The checkout and ref must be in the same step.
+  uses `${{ github.event.pull_request.head.sha }}`,
+  `${{ github.event.pull_request.head.ref }}`, or `${{ github.head_ref }}` — high.
+  The checkout and ref must be in the same step; pinning the checkout action to a
+  full commit SHA does not suppress this separate check. Matching is literal and
+  case-sensitive, allows whitespace inside the expression braces, and also
+  matches a supported expression embedded in a longer ref string. The scanner
+  does not evaluate expressions: bracket notation such as
+  `${{ github['head_ref'] }}`, indirect references such as `${{ env.SELECTED_REF }}`,
+  and expressions containing operators such as `${{ github.head_ref || 'main' }}`
+  do not match these forms. No finding therefore does not establish that the
+  checkout ref is independent of PR input.
 * `.npmrc` containing an exact unscoped or registry-scoped `_authToken` key
   followed by `=`, or a `password` line — high. The token key must begin the line
   after optional whitespace; spaces or tabs before `=` are accepted. Token markers
   inside other option names, values, or trailing comments do not count.
   `.pypirc` retains the exact `_authToken=` substring check and the anchored
   spaced-key form, as well as the `password` rule.
+  In both files, `_authToken` matching is case-sensitive and requires `=`;
+  `_AUTHTOKEN=x` and `_authToken: x` do not trigger this config check.
+  The `password` key is case-insensitive, must begin the line after optional
+  whitespace, and accepts `:` or `=` after optional whitespace (for example,
+  `PassWord : x`). Names such as `db_password` and `password_extra` do not match.
+  Ignored lines do not prevent a later qualifying line from being reported.
+  These are scanner selection rules, not a full interpretation of package-manager
+  configuration; independently eligible secret patterns can still be reported.
   Empty or whitespace-only `password=` / `password:` fields are ignored;
   later credential lines are still checked. Quoted values and inline comments
   after the delimiter remain nonempty for this conservative heuristic.
@@ -961,6 +1444,22 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   (including inline steps/checkout inputs), multiline quoted scalars and indirect
   expressions are not resolved; these forms may be missed. These checks are review
   prompts, not proof of exploitability or a complete workflow audit.
+  Job and step `if:` conditions are not evaluated: even `if: false` or
+  `if: ${{ false }}` does not suppress a matching declaration. For example, an
+  unpinned checkout in a disabled step still produces the low-severity finding;
+  a disabled PR job requesting write permissions still produces the medium one.
+  These findings remain in JSON and triage and can trigger `--fail-on` at the
+  corresponding threshold. They describe configuration text, not whether a job
+  or step will execute.
+  The unpinned-reference check recognizes remote `owner/repo[/path]@ref` values
+  in step and reusable-workflow `uses:` declarations. Any exactly 40-character
+  hexadecimal ref (uppercase or lowercase, even all zeros) passes this shape
+  check; tags, branches, short hashes and non-hex refs produce the low-severity
+  finding. It does not fetch the ref or verify commit existence, provenance or
+  trust. Local `./` and `../` refs, `docker://` container refs and values without
+  `@ref` are outside this check, so no pin finding does not establish their safety
+  or validity. A full-shaped checkout SHA does not suppress the separate
+  `pull_request_target` PR-head checkout finding, its review triage or its gate.
 * **No false-positive review.** Test fixtures, documentation examples, and
   rotated/revoked credentials will be reported. The only heuristic filters are
   the path rules and the value-shape hints (v0.4.1) described above; a committed
@@ -985,6 +1484,8 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   gate therefore do not establish coverage of excluded subtrees.
 * Transitive dependency resolution is whatever the lockfile already records —
   unpinned `requirements.txt` lines (`>=`, `~=`, unpinned) are ignored entirely.
+  Wildcard `==` versions (`demo==1.*`) are prefix ranges, not exact versions, and
+  are skipped too, so they appear in neither inventory nor advisory queries.
   Requirements environment markers after `;` are discarded without evaluation:
   `demo==1.0; python_version < "0"` still contributes `demo` version `1.0` to
   inventory and, when enabled, advisory queries. Extras are stripped from names
@@ -992,10 +1493,15 @@ base-image metadata, variable expansion and runtime overrides are not resolved.
   resolution. Duplicate package/version pins count once, while distinct pinned
   versions remain even under mutually exclusive markers. This is a static
   inventory, not the resolved installation for the current interpreter or platform.
-* Go: `go.mod`'s `require` set (direct + indirect) is the build list and is what
-  gets queried; `go.sum` is only read when no `go.mod` sits beside it, because it
-  also records superseded module versions (v0.4 — the 2026-10-08 dataset showed
-  99% of `go.sum` hits were not in `go.mod`). No call-graph reachability: use
+* Go: the scanner queries the module paths and versions recorded in `go.mod`
+  `require` entries (direct + indirect), not a resolved build list. It ignores
+  `replace` and `exclude` directives: a replaced or excluded requirement still
+  enters inventory and, when enabled, advisory lookup under its original path
+  and version. Replacement targets are not followed or substituted; directives
+  alone add no packages. No Go toolchain or module-graph resolution is run.
+  `go.sum` is only read when no `go.mod` sits beside it, because it also records
+  superseded module versions (v0.4 — the 2026-10-08 dataset showed 99% of
+  `go.sum` hits were not in `go.mod`). No call-graph reachability: use
   `govulncheck` for that.
 * Yarn v1 and Yarn Berry (v2+) lockfiles are parsed (Berry since v0.4; workspace/
   patch/portal entries are skipped). `composer.lock`, Maven/Gradle and NuGet are not.
@@ -1025,7 +1531,25 @@ For `Dockerfile` and `Dockerfile.*`, config findings also cover:
 
 * `ADD` with an HTTP(S) source, including JSON operands and leading options — low.
   URLs are omitted from evidence, including user info and query strings.
+  The check matches literal `http://` or `https://` prefixes case-insensitively
+  in source operands (all operands except the last, treated as the destination).
+  It emits one finding per instruction, even with multiple remote sources.
+  Leading `--name=value` options, including `--checksum`, do not suppress it:
+  a checksum-pinned HTTP(S) source still receives the same low-severity review
+  finding and can trip `--fail-on low`. Checksums and downloaded contents are
+  not validated. Local paths, Git/SSH/FTP forms, and `$SOURCE` / `${SOURCE}`
+  references do not match this rule; variables are not expanded. A URL appearing
+  only as the destination does not match either. This is a source-shape check,
+  not validation of Docker syntax or a claim that a download is unverified.
 * Shell-form `RUN` directly piping `curl` into `sh` or `bash` — medium.
+  The check compares command basenames, so `/usr/bin/curl ... | /bin/sh`
+  also matches, including after `;`, `&&` or `||`. It emits at most one
+  pipeline finding per `RUN`. The pipe must be a single `|` token; `|&`,
+  intervening commands, wrappers such as `env`/`sudo`, and assignments before
+  `curl` are not recognized. Quoting is removed during tokenization, so a
+  quoted argument whose entire value is `|` can also trigger this heuristic
+  (for example `RUN curl '|' sh`); a finding does not establish that the shell
+  executes a pipeline. Scripts and URLs are never fetched or executed.
 * `ENV`/`ARG` assignments with nonempty values and secret-like variable names
   (for example `API_TOKEN`, `DB_PASSWORD`, `PRIVATE_KEY`, `AWS_SECRET_ACCESS_KEY`)
   — high. Only names are reported. Unset arguments, empty values and plain
@@ -1037,6 +1561,19 @@ For `Dockerfile` and `Dockerfile.*`, config findings also cover:
   with a literal group (`root:app`, `0:1000`) — low. Earlier stages and overridden
   users are excluded. Variable-based users, inherited image users, and user-name
   to UID mappings are not resolved; a root group alone does not trigger this check.
+  The check matches the literal, case-sensitive instruction value: `ROOT`, `00`,
+  quoted `"root"`, and `root # comment` are not recognized as explicit root.
+  A group suffix must be nonempty and contain only ASCII letters, digits,
+  underscores, periods or hyphens. These exclusions do not establish a non-root
+  runtime identity.
+
+The missing-`USER` rule emits one low finding with a null source line only when
+no parsed `USER` instruction appears anywhere in the file. For example,
+`FROM scratch AS builder`, `USER root`, then `FROM builder` produces neither
+USER finding: the earlier instruction suppresses the whole-file missing-user
+check, while the final stage has no explicit user to match. The scanner does not
+resolve user inheritance from a prior stage or an image. For an explicit final
+root user continued across lines, the finding points to the first physical line.
 
 These are bounded syntax heuristics. Continuations retain the first physical
 line number, comments and simple named heredoc bodies are skipped, and malformed

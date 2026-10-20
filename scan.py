@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """feldspar-discovery-scan: deterministic, dependency-free repo scanner.
 
-Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--no-osv]
+Usage: scan.py <local-repo-path-or-git-https-url> [--json out.json] [--osv | --no-osv]
                [--fail-on SEV] [--triage | --no-triage] [--compact | --pretty | --indent N]
-               [--sort-keys | --no-sort-keys] [--unicode-json]
-               [--no-timestamp] [--no-commit] [--quiet] [--summary-only]
+               [--sort-keys | --no-sort-keys] [--unicode-json | --ascii-json]
+               [--no-timestamp] [--no-commit] [--quiet] [--summary-only | --full-report]
+               [--timestamp] [--commit] [--no-quiet]
+               [--tab-indent]
        scan.py --version
 
 For local directories named -h, --help, or --version, use an explicit path:
@@ -18,17 +20,25 @@ For local directories named -h, --help, or --version, use an explicit path:
   --compact       write JSON on one line, to stdout or --json PATH.
   --pretty        write two-space indented JSON (default); last formatting flag wins.
   --indent N      use N spaces per JSON level, one digit 0 through 8.
+                  Also accepts --indent=N.
                   Zero retains newlines without indentation; last formatting flag wins.
+  --tab-indent    use one tab per JSON level; last formatting flag wins.
   --sort-keys     alphabetically sort JSON object keys, including nested objects.
   --no-sort-keys  preserve default object-key order; last key-order flag wins.
   --unicode-json  retain non-ASCII characters in JSON (default: escape them).
                   Named files use UTF-8; stdout needs a Unicode-capable encoding.
+  --ascii-json    escape non-ASCII characters (default); last encoding flag wins.
+  --timestamp     include scanned_at (default); last timestamp flag wins.
   --no-timestamp  omit scanned_at from JSON; other report fields are unchanged.
   --no-commit     skip Git HEAD lookup; report commit as null (also used in manifest_hash).
                   URL targets still clone; this does not disable network access.
+  --commit        restore Git HEAD lookup (default); last commit flag wins.
   --quiet         suppress the file-write confirmation; keep JSON, errors and gate diagnostics.
+  --no-quiet      restore file-write confirmation (default); last confirmation flag wins.
   --summary-only omit findings and per-finding triage; keep summaries and errors.
                   Scanning, manifest_hash and severity-gate exits are unchanged.
+  --full-report  include findings and optional triage (default); last report-detail flag wins.
+  --osv           enable OSV dependency advisory lookups (default); last lookup flag wins.
   --no-osv        skip OSV dependency advisory lookups;
                   package inventory and local secret/config checks still run.
                   URL targets still clone; use a local path for offline scanning.
@@ -89,7 +99,7 @@ except ImportError:  # pragma: no cover - py<3.11
     tomllib = None
 
 SCANNER = "feldspar-discovery-scan"
-VERSION = "0.4.22"
+VERSION = "0.4.29"
 OSV_BATCH = "https://api.osv.dev/v1/querybatch"
 OSV_VULN = "https://api.osv.dev/v1/vulns/"
 HTTP_TIMEOUT = 20
@@ -172,6 +182,8 @@ def redact(value, n=4):
 # ------------------------------------------------------------ dep parsers
 def parse_requirements(text):
     out = []
+    if text.startswith("\ufeff"):
+        text = text[1:]  # A UTF-8 signature is not part of a package name or option.
     for line in text.splitlines():
         line = line.split("#", 1)[0].strip()
         if not line or line.startswith("-"):
@@ -182,7 +194,7 @@ def parse_requirements(text):
         name, _, ver = line.partition("==")
         name = re.split(r"[\[<>!~ ]", name.strip())[0].strip()
         ver = ver.strip().strip('"\'')
-        if name and re.match(r"^[0-9][^\s,=<>!]*$", ver):
+        if name and re.match(r"^[0-9][^\s,=<>!*]*$", ver):
             out.append(("PyPI", name, ver))
     return out
 
@@ -205,6 +217,8 @@ def parse_toml_packages(text, ecosystem):
             if n and v:
                 if not isinstance(n, str) or not isinstance(v, str):
                     return []
+                if not n.strip() or not v.strip():
+                    continue
                 out.append((ecosystem, n, str(v)))
         return out
     # Older Python versions without tomllib retain the line-based fallback.
@@ -220,7 +234,8 @@ def parse_toml_packages(text, ecosystem):
         if m:
             ver = m.group(1)
         if name and ver:
-            out.append((ecosystem, name, ver))
+            if name.strip() and ver.strip():
+                out.append((ecosystem, name, ver))
             name = ver = None
     return out
 
@@ -246,7 +261,7 @@ def parse_package_lock(text):
                 name = key.rsplit("node_modules/", 1)[1]
             else:
                 continue
-            if name and isinstance(ver, str) and ver:
+            if name and isinstance(ver, str) and ver.strip():
                 out.append(("npm", name, ver))
     deps = data.get("dependencies")
     if isinstance(deps, dict) and not out:
@@ -260,7 +275,7 @@ def parse_package_lock(text):
             name, meta = item
             if isinstance(meta, dict):
                 ver = meta.get("version")
-                if isinstance(ver, str) and ver:
+                if name and isinstance(ver, str) and ver.strip():
                     out.append(("npm", name, ver))
                 if isinstance(meta.get("dependencies"), dict):
                     stack.append(iter(meta["dependencies"].items()))
@@ -274,6 +289,8 @@ def parse_yarn_lock(text):
     """Yarn v1 (`name@^1.0.0:` / `  version "1.0.0"`) and Yarn Berry v2+ (`"name@npm:^1.0.0":` /
     `  version: 1.0.0`, `__metadata:` header). Workspace/patch/portal entries are not registry packages
     and are skipped (v0.4 — before this, Berry lockfiles silently yielded 0 packages)."""
+    if text.startswith("\ufeff"):
+        text = text[1:]  # A UTF-8 signature is not part of the first descriptor.
     out = []
     names = []
     for line in text.splitlines():
@@ -323,7 +340,7 @@ def parse_pnpm_lock(text):
     for line in text.splitlines():
         if line.startswith("#"):
             continue  # Unindented comments do not end the packages section.
-        if re.match(r"^packages:\s*$", line):
+        if re.fullmatch(r"packages:(?:\s+#.*)?\s*", line):
             in_pkgs = True
             continue
         if in_pkgs and line and not line.startswith((" ", "\t")):
@@ -348,7 +365,7 @@ def parse_pnpm_lock(text):
 def parse_go_sum(text):
     """go.sum lists EVERY module version the module graph ever touched, including superseded ones
     (dataset 2026-10-08: 1,089 of 1,099 vulnerable go.sum rows were not in go.mod). It is only used
-    when no go.mod sits beside it (v0.4); prefer parse_go_mod."""
+    when no go.mod sits beside it (v0.4); prefer the require inventory from parse_go_mod."""
     out = []
     for line in text.splitlines():
         parts = line.split()
@@ -365,7 +382,7 @@ def parse_go_sum(text):
 
 
 def parse_go_mod(text):
-    """The `require` set of go.mod = the module's build list (direct + `// indirect`, Go 1.17+)."""
+    """Read recorded go.mod requirements; ignore replace/exclude and do not resolve a build list."""
     out = []
     in_req = False
     for line in text.splitlines():
@@ -403,7 +420,7 @@ def parse_gemfile_lock(text):
         if not in_specs:
             continue
         m = re.match(r"^\s{4}([A-Za-z0-9_.\-]+) \(([^)]+)\)\s*$", line)
-        if m:
+        if m and m.group(2).strip():
             out.append(("RubyGems", m.group(1), m.group(2)))
     return out
 
@@ -433,7 +450,7 @@ def collect_packages(root, files):
         if handler is None:
             continue
         if base == "go.sum" and os.path.dirname(path) in gomod_dirs:
-            continue  # go.mod beside it is the build list; go.sum also records superseded versions
+            continue  # Prefer recorded go.mod requirements; go.sum includes superseded versions.
         text = read_text(path, 8 * 1024 * 1024)
         if text is None:
             continue
@@ -1028,7 +1045,9 @@ def triage_findings(findings):
     per_id = {}
     by_action = {"upgrade": 0, "monitor": 0, "review": 0, "informational": 0}
     files_by_action = {action: set() for action in by_action}
+    dependency_actions_by_file = {}
     dep_upgrade = dep_monitor = dep_scaffold = 0
+    dependency_actions_by_ecosystem = {}
     dep_upgrade_files = set()
     dependency_actions_by_severity = {
         action: dict.fromkeys((*SEV_ORDER, "unknown"), 0)
@@ -1037,10 +1056,13 @@ def triage_findings(findings):
     outside_scaffold = {"upgradeable": 0, "monitor_only": 0}
     sec_total = sec_fp = 0
     sec_review_files = set()
+    secret_review_by_file = {}
     secret_fp_reasons = {}
+    secret_fp_by_file = {}
     sec_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     config_review = 0
     config_review_files = set()
+    config_review_by_file = {}
     config_review_by_severity = dict.fromkeys((*SEV_ORDER, "unknown"), 0)
     for f in findings:
         cat = f["category"]
@@ -1060,10 +1082,16 @@ def triage_findings(findings):
                               "version, monitor the advisory, and apply any documented "
                               "mitigation. Not fixable by upgrade today.")}
                 dep_monitor += 1
+            ecosystem = f.get("ecosystem") or "unknown"
+            actions = dependency_actions_by_ecosystem.setdefault(
+                ecosystem, {"upgrade": 0, "monitor": 0})
+            actions[t["action"]] += 1
             counts = dependency_actions_by_severity[t["action"]]
             severity = f.get("severity", "unknown")
             counts[severity] = counts.get(severity, 0) + 1
             lock = f.get("file") or ""
+            file_actions = dependency_actions_by_file.setdefault(lock, {"upgrade": 0, "monitor": 0})
+            file_actions[t["action"]] += 1
             m = TEST_PATH_RE.search(lock)
             if m:
                 # dataset 2026-10-08: react 546/618 and next.js 120/366 vulnerable rows came from
@@ -1083,6 +1111,8 @@ def triage_findings(findings):
             is_fp, reason = _secret_false_positive(f)
             if is_fp:
                 sec_fp += 1
+                path = f["file"]
+                secret_fp_by_file[path] = secret_fp_by_file.get(path, 0) + 1
                 secret_fp_reasons[reason] = secret_fp_reasons.get(reason, 0) + 1
                 t = {"action": "informational", "likely_false_positive": True,
                      "reason": reason,
@@ -1091,6 +1121,8 @@ def triage_findings(findings):
                 severity = f.get("severity", "unknown")
                 sec_review_by_severity[severity] = sec_review_by_severity.get(severity, 0) + 1
                 sec_review_files.add(f["file"])
+                path = f["file"]
+                secret_review_by_file[path] = secret_review_by_file.get(path, 0) + 1
                 t = {"action": "review", "likely_false_positive": False,
                      "note": ("In a non-test path; confirm it is not a live credential and, "
                               "if real, rotate it and purge it from history.")}
@@ -1100,6 +1132,8 @@ def triage_findings(findings):
                 config_review += 1
                 if f.get("file"):
                     config_review_files.add(f["file"])
+                    path = f["file"]
+                    config_review_by_file[path] = config_review_by_file.get(path, 0) + 1
                 severity = f.get("severity", "unknown")
                 config_review_by_severity[severity] = config_review_by_severity.get(severity, 0) + 1
         per_id[f["id"]] = t
@@ -1113,15 +1147,20 @@ def triage_findings(findings):
                        "in_scaffold_lockfiles": dep_scaffold},
         "dependency_files_needing_upgrade": len(dep_upgrade_files),
         "dependency_outside_scaffold_lockfiles": outside_scaffold,
+        "dependency_actions_by_file": dict(sorted(dependency_actions_by_file.items())),
         "dependency_actions_by_severity": dependency_actions_by_severity,
+        "dependency_actions_by_ecosystem": dict(sorted(dependency_actions_by_ecosystem.items())),
         "secrets": {"total": sec_total, "likely_false_positive": sec_fp,
                     "needs_review": sec_total - sec_fp},
         "config": {"needs_review": config_review},
         "config_files_needing_review": len(config_review_files),
+        "config_review_by_file": dict(sorted(config_review_by_file.items())),
         "config_review_by_severity": config_review_by_severity,
         "secret_review_by_severity": sec_review_by_severity,
         "secret_files_needing_review": len(sec_review_files),
+        "secret_review_by_file": dict(sorted(secret_review_by_file.items())),
         "secret_false_positive_reasons": dict(sorted(secret_fp_reasons.items())),
+        "secret_false_positives_by_file": dict(sorted(secret_fp_by_file.items())),
         "headline": _triage_headline(dep_upgrade, dep_monitor, sec_total - sec_fp, sec_fp,
                                      dep_scaffold, config_review),
     }
@@ -1156,6 +1195,8 @@ def main(argv):
     unicode_json = False
     i = 1
     while i < len(args):
+        if args[i].startswith("--indent="):
+            args[i:i + 1] = args[i].split("=", 1)
         if args[i].startswith("--fail-on="):
             args[i:i + 1] = args[i].split("=", 1)
         if args[i] in ("-h", "--help"):
@@ -1169,6 +1210,9 @@ def main(argv):
             if not out_path:
                 sys.stderr.write("--json requires a non-empty path" + chr(10))
                 return 2
+            i += 1
+        elif args[i] == "--osv":
+            use_osv = True
             i += 1
         elif args[i] == "--no-osv":
             use_osv = False
@@ -1185,9 +1229,16 @@ def main(argv):
         elif args[i] == "--unicode-json":
             unicode_json = True
             i += 1
+        elif args[i] == "--ascii-json":
+            unicode_json = False
+            i += 1
         elif args[i] == "--pretty":
             compact = False
             json_indent = 2
+            i += 1
+        elif args[i] == "--tab-indent":
+            compact = False
+            json_indent = "\t"
             i += 1
         elif args[i] == "--indent":
             if i + 1 >= len(args) or re.fullmatch(r"[0-8]", args[i + 1]) is None:
@@ -1196,6 +1247,9 @@ def main(argv):
             json_indent = int(args[i + 1])
             compact = False
             i += 2
+        elif args[i] == "--timestamp":
+            no_timestamp = False
+            i += 1
         elif args[i] == "--no-timestamp":
             no_timestamp = True
             i += 1
@@ -1208,8 +1262,17 @@ def main(argv):
         elif args[i] == "--no-commit":
             include_commit = False
             i += 1
+        elif args[i] == "--commit":
+            include_commit = True
+            i += 1
         elif args[i] == "--quiet":
             quiet = True
+            i += 1
+        elif args[i] == "--full-report":
+            summary_only = False
+            i += 1
+        elif args[i] == "--no-quiet":
+            quiet = False
             i += 1
         elif args[i] == "--summary-only":
             summary_only = True
@@ -1298,28 +1361,49 @@ def main(argv):
                                  f["package"] or "", f["summary"]))
     by_sev = {"critical": 0, "high": 0, "medium": 0, "low": 0, "unknown": 0}
     files_by_sev = {severity: set() for severity in by_sev}
+    finding_lines_by_sev = {severity: set() for severity in by_sev}
     by_category = {"dependency-vuln": 0, "secret": 0, "config": 0}
     by_category_severity = {category: dict.fromkeys(by_sev, 0) for category in by_category}
     findings_by_path_context = {"scaffold": 0, "other": 0}
+    finding_files_by_path_context = {context: set() for context in findings_by_path_context}
+    finding_lines_by_path_context = {context: set() for context in findings_by_path_context}
+    finding_lines_by_file = {}
     highest_severity_by_file = {}
     secret_hits_by_rule = {}
+    secret_hits_by_file = {}
+    advisories_by_ecosystem = {}
     dependency_findings_by_advisory = {}
+    dependency_files_by_advisory = {}
     dependency_findings_by_ecosystem = {}
+    dependency_findings_by_manifest = {}
     for n, f in enumerate(findings, 1):
         f["id"] = "F-%03d" % n
+        if f["line"] is not None:
+            finding_lines_by_file.setdefault(f["file"], set()).add(f["line"])
         context = "scaffold" if TEST_PATH_RE.search(f["file"]) else "other"
         findings_by_path_context[context] += 1
+        finding_files_by_path_context[context].add(f["file"])
+        if f["line"] is not None:
+            finding_lines_by_path_context[context].add((f["file"], f["line"]))
         by_sev[f["severity"]] = by_sev.get(f["severity"], 0) + 1
         files_by_sev.setdefault(f["severity"], set()).add(f["file"])
+        if f["line"] is not None:
+            finding_lines_by_sev.setdefault(f["severity"], set()).add((f["file"], f["line"]))
         by_category[f["category"]] = by_category.get(f["category"], 0) + 1
         if f["category"] == "dependency-vuln":
             ecosystem = f["ecosystem"]
             dependency_findings_by_ecosystem[ecosystem] = dependency_findings_by_ecosystem.get(ecosystem, 0) + 1
+            manifest = f["file"]
+            dependency_findings_by_manifest[manifest] = dependency_findings_by_manifest.get(manifest, 0) + 1
         if f["category"] == "secret":
+            path = f["file"]
+            secret_hits_by_file[path] = secret_hits_by_file.get(path, 0) + 1
             label = f["summary"]
             secret_hits_by_rule[label] = secret_hits_by_rule.get(label, 0) + 1
         if f["category"] == "dependency-vuln":
             for advisory in set(f["vuln_ids"]):
+                dependency_files_by_advisory.setdefault(advisory, set()).add(f["file"])
+                advisories_by_ecosystem.setdefault(f["ecosystem"], set()).add(advisory)
                 dependency_findings_by_advisory[advisory] = (
                     dependency_findings_by_advisory.get(advisory, 0) + 1)
         # Findings are already sorted from highest to lowest severity.
@@ -1335,6 +1419,18 @@ def main(argv):
     for ecosystem, _, _ in sorted(pkgs):
         packages_by_ecosystem[ecosystem] = packages_by_ecosystem.get(ecosystem, 0) + 1
 
+    package_versions = {}
+    for ecosystem, name, version in sorted(pkgs):
+        package_versions.setdefault((ecosystem, name), []).append(version)
+    multi_version_packages = {}
+    for (ecosystem, name), versions in package_versions.items():
+        if len(versions) > 1:
+            multi_version_packages.setdefault(ecosystem, {})[name] = versions
+
+    package_names_by_ecosystem = {}
+    for ecosystem, name, _ in sorted(pkgs):
+        package_names_by_ecosystem.setdefault(ecosystem, set()).add(name)
+
     vulnerable_packages_by_ecosystem = {}
     for ecosystem, _, _ in sorted(vulnerable):
         vulnerable_packages_by_ecosystem[ecosystem] = vulnerable_packages_by_ecosystem.get(ecosystem, 0) + 1
@@ -1349,10 +1445,13 @@ def main(argv):
         packages_by_path_context[context] += 1
 
     config_issues_by_rule = {}
+    config_issues_by_file = {}
     for f in findings:
         if f["category"] == "config":
             label = f["summary"]
             config_issues_by_rule[label] = config_issues_by_rule.get(label, 0) + 1
+            path = f["file"]
+            config_issues_by_file[path] = config_issues_by_file.get(path, 0) + 1
 
     config_lines_by_rule = {}
     for f in findings:
@@ -1382,14 +1481,33 @@ def main(argv):
         "scanned_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "summary": {
             "total_findings": len(findings),
+            "findings_without_line": sum(1 for f in findings if f["line"] is None),
             "finding_lines": len({(f["file"], f["line"]) for f in findings
                                   if f["line"] is not None}),
+            "finding_lines_by_category": {
+                category: len({(f["file"], f["line"]) for f in findings
+                               if f["category"] == category and f["line"] is not None})
+                for category in by_category
+            },
+            "finding_lines_by_severity": {
+                severity: len(locations) for severity, locations in finding_lines_by_sev.items()
+            },
+            "finding_lines_by_file": {
+                path: len(lines) for path, lines in sorted(finding_lines_by_file.items())
+            },
             "findings_by_path_context": findings_by_path_context,
+            "files_with_findings_by_path_context": {
+                context: len(paths) for context, paths in finding_files_by_path_context.items()
+            },
+            "finding_lines_by_path_context": {
+                context: len(locations) for context, locations in finding_lines_by_path_context.items()
+            },
             "files_scanned": len(files),
             "files_without_findings": sum(
                 1 for path in files if os.path.relpath(path, root) not in findings_per_file),
             "files_with_findings": len({f["file"] for f in findings}),
             "findings_by_file": dict(sorted(findings_per_file.items())),
+            "files_with_multiple_findings": sum(count >= 2 for count in findings_per_file.values()),
             "files_with_findings_by_category": {
                 category: len({f["file"] for f in findings if f["category"] == category})
                 for category in by_category
@@ -1397,6 +1515,10 @@ def main(argv):
             "skipped_non_regular": skipped["non_regular"],
             "packages_found": len(pkgs),
             "packages_by_ecosystem": packages_by_ecosystem,
+            "multi_version_packages": multi_version_packages,
+            "package_names_by_ecosystem": {
+                ecosystem: len(names) for ecosystem, names in package_names_by_ecosystem.items()
+            },
             "packages_by_path_context": packages_by_path_context,
             "packages_by_manifest": packages_by_manifest,
             "vulnerable_packages": len(vulnerable),
@@ -1410,16 +1532,26 @@ def main(argv):
                 for ecosystem, paths in sorted(dependency_files_by_ecosystem.items())
             },
             "dependency_findings_by_ecosystem": dict(sorted(dependency_findings_by_ecosystem.items())),
+            "dependency_findings_by_manifest": dict(sorted(dependency_findings_by_manifest.items())),
             "unique_advisories": len({vid for f in findings
                                       if f["category"] == "dependency-vuln"
                                       for vid in f["vuln_ids"]}),
+            "unique_advisories_by_ecosystem": {
+                ecosystem: len(advisories)
+                for ecosystem, advisories in sorted(advisories_by_ecosystem.items())
+            },
             "dependency_findings_by_advisory": dict(sorted(dependency_findings_by_advisory.items())),
+            "dependency_files_by_advisory": {
+                advisory: len(paths)
+                for advisory, paths in sorted(dependency_files_by_advisory.items())
+            },
             "osv_enabled": use_osv,
             "errors_count": len(ERRORS),
             "secret_hits": sum(1 for f in findings if f["category"] == "secret"),
             "secret_lines": len({(f["file"], f["line"]) for f in findings
                                  if f["category"] == "secret"}),
             "secret_hits_by_rule": dict(sorted(secret_hits_by_rule.items())),
+            "secret_hits_by_file": dict(sorted(secret_hits_by_file.items())),
             "secret_files_by_rule": {
                 rule: len(paths) for rule, paths in sorted(secret_files_by_rule.items())
             },
@@ -1436,6 +1568,7 @@ def main(argv):
                 rule: len(paths) for rule, paths in sorted(config_files_by_rule.items())
             },
             "config_issues_by_rule": dict(sorted(config_issues_by_rule.items())),
+            "config_issues_by_file": dict(sorted(config_issues_by_file.items())),
             "by_severity": by_sev,
             "files_by_severity": {severity: len(paths) for severity, paths in files_by_sev.items()},
             "highest_severity": findings[0]["severity"] if findings else None,
