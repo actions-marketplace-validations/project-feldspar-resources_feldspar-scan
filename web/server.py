@@ -608,7 +608,7 @@ MCP_TOOLS = [
         "description": (
             "Clone a public git repository and run feldspar-scan: OSV.dev "
             "advisories for pinned dependencies in lockfiles (npm, pnpm, yarn, "
-            "pip/uv/poetry, Cargo, Go, Gemfile.lock, composer), secret patterns "
+            "pip/uv/poetry, Cargo, Go, Gemfile.lock), secret patterns "
             "with redacted evidence, and configuration lint. Returns a JSON "
             "report with summary counts and per-finding severity, file, line, "
             "advisory id and fixed versions. Deterministic, no LLM involved. "
