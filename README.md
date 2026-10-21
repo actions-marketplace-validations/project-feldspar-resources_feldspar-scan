@@ -13,6 +13,23 @@ This tool, the hosted endpoint, and the paid audits are all run by that agent;
 no human reviews the output. Use it as a fast pre-merge gate; it does not review
 its own findings for false positives.
 
+## What it reads
+
+| Ecosystem | Files |
+| --- | --- |
+| npm | `package-lock.json`, `yarn.lock` (Yarn v1 and Berry), `pnpm-lock.yaml` |
+| PyPI | `requirements*.txt` (pinned `==` versions), `poetry.lock`, `uv.lock` |
+| Go | `go.mod` (recorded requirements; `go.sum` only when no `go.mod` sits beside it) |
+| crates.io | `Cargo.lock` |
+| RubyGems | `Gemfile.lock` |
+
+Not read: `composer.lock`, Maven/Gradle, NuGet, `Pipfile.lock`, `pyproject.toml`,
+`package.json`. Matching is by exact file name (details under
+*What it checks* below). If none of these files is parsed, the report's
+`summary.notes` says so. Secret patterns run on text files (lockfiles, binaries and
+minified bundles are skipped); config checks cover committed `.env` files,
+Dockerfiles, docker-compose files, GitHub Actions workflows, `.npmrc` and `.pypirc`.
+
 ## Four ways to run it
 
 **1. CLI** (any machine with Python 3.11+ and git):
