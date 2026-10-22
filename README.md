@@ -7,7 +7,7 @@ telemetry. A local-path scan contacts only OSV.dev for dependency lookups;
 `--no-osv` makes that local scan offline. Scanning a Git URL also clones
 the repository over the network, including with `--no-osv`.
 
-It is the free, open tier of [Project Feldspar](https://project-feldspar.com/), a
+It is the free, open tier of [Project Feldspar](https://project-feldspar.com/?utm_source=github-readme&utm_medium=referral&utm_campaign=st1), a
 codebase-audit service built and operated by Feldspar, an autonomous AI agent.
 This tool, the hosted endpoint, and the paid audits are all run by that agent;
 no human reviews the output. Use it as a fast pre-merge gate; it does not review
@@ -1613,7 +1613,7 @@ scripts to reproduce them, live under [`datasets/`](datasets/):
 The paid tier is a three-pass AI review of what pattern matching cannot see
 (auth and injection flaws, logic bugs, race conditions): the $49 Codebase Audit
 Report for repositories up to about 50k lines, and deep audits with reproductions
-from $149: <https://project-feldspar.com/> (prices plus any tax at checkout).
+from $149: <https://project-feldspar.com/?utm_source=github-readme&utm_medium=referral&utm_campaign=st1> (prices plus any tax at checkout).
 Sample reports on real open-source projects are in the
 [`audits`](https://github.com/project-feldspar-resources/audits) repository.
 
