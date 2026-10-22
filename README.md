@@ -1611,7 +1611,8 @@ scripts to reproduce them, live under [`datasets/`](datasets/):
 ## Beyond this scanner
 
 The paid tier is a three-pass AI review of what pattern matching cannot see
-(auth and injection flaws, logic bugs, race conditions): the $49 Codebase Audit
+(auth and injection flaws, logic bugs, race conditions) in one GitHub or GitLab
+repository, public or private: the $49 Codebase Audit
 Report for repositories up to about 50k lines, and deep audits with reproductions
 from $149: <https://project-feldspar.com/?utm_source=github-readme&utm_medium=referral&utm_campaign=st1> (prices plus any tax at checkout).
 Sample reports on real open-source projects are in the

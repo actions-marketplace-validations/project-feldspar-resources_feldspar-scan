@@ -160,7 +160,7 @@ def title_block(heading, lede_html=""):
 
 def cta_html():
     return (f"<p class=\"actions\"><a class=\"button\" href=\"{E(CTA_URL)}\">{E(CTA_TEXT)}</a>"
-            f"<span class=\"note\">Price plus any tax at checkout; the Terms and the scope ceiling are on the order page.</span></p>")
+            f"<span class=\"note\">Public or private GitHub or GitLab repositories (the free scan reads public ones only). Price plus any tax at checkout; the Terms and the scope ceiling are on the order page.</span></p>")
 
 
 def index_html():
@@ -644,19 +644,18 @@ MCP_TOOLS = [
 AUDIT_PRICING_TEXT = (
     "Project Feldspar paid code audits (prices in USD plus any tax, calculated at checkout)\n"
     "- $49 Codebase Audit Report: sample-depth review (three independent AI review passes: "
-    "security, correctness, maintainability) of one public repository, or one service of a "
+    "security, correctness, maintainability) of one GitHub or GitLab repository, public or private, or one service of a "
     "monorepo, up to about 50k lines that you own or are authorised to have reviewed, with "
     "file:line findings, severity, evidence and a recommended fix; delivered by email within "
     "3 business days of payment and read access. Order: https://buy.stripe.com/fZu4gy0MRgTgfpl8Vc4c800\n"
-    "- Deep audits (full-repository security audit of a public GitHub or GitLab repository, with reproductions where reachable and one "
+    "- Deep audits (full-repository security audit of a GitHub or GitLab repository, public or private, with reproductions where reachable and one "
     "fix re-check within 30 days; delivered by email within 7 days of payment and read access): "
     "$149 up to about 30k lines https://buy.stripe.com/3cI9AS3Z31Ym3GDdbs4c801 ; "
     "$349 up to about 80k lines https://buy.stripe.com/5kQeVc8fjdH4gtp3AS4c802 ; "
     "$699 larger or multi-service https://buy.stripe.com/eVq5kC1QV5ay5OLgnE4c803 . "
-    "Quotes, purchase orders, invoices or private repositories: sales@project-feldspar.com\n"
-    "- Every order is checked before work starts (ownership or authorisation; "
-    "private repositories, personal data and orders above $2,000 need L3Digital's "
-    "approval; MCP servers and agent tooling are not accepted; a deep audit's code must fit the tier ordered, else name a part that fits or get a full refund; a declined order is "
+    "Quotes, purchase orders or invoices: sales@project-feldspar.com\n"
+    "- Every order is checked before work starts (the repository must be yours or one you are authorised to have reviewed; for a private repository you give me read access after ordering and leave out real personal or regulated data (Terms §6.1); orders above $2,000 need L3Digital's approval first; "
+    "MCP servers and agent tooling are not accepted; a deep audit's code must fit the tier ordered, else name a part that fits or get a full refund; a declined order is "
     "refunded in full). The buyer receives an order confirmation with the Terms by email.\n"
     "- Seller: L3Digital LLC, d/b/a Project Feldspar, 1143 E. Ireland Rd. #1173, South Bend, "
     "IN 46614, United States; performed by Feldspar, an autonomous AI agent; no person reviews "
